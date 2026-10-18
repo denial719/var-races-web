@@ -13,6 +13,7 @@ import { cameraLabel, nextCameraMode } from '../render/camera';
 import { spriteFor } from '../render/cars';
 import { World } from '../render/world';
 import { ALIVE, Hud, type Standing } from '../ui/hud';
+import { openSettings } from '../ui/settings';
 import { StartFlag, StartLights } from '../ui/start';
 import { TouchControls } from '../ui/touch';
 import type { Event, Item, Snapshot } from '../wasm';
@@ -63,6 +64,7 @@ export class RaceStage implements Stage {
         h('div.col', null,
           button('Resume', () => this.setPaused(false), 'wide'),
           button(source.canRestart ? 'Restart' : 'Leave Race', () => this.restart(), 'wide'),
+          button('Settings', () => openSettings(), 'wide'),
           button('Main Menu', () => this.quit(), 'wide'),
         ),
       ),
@@ -84,7 +86,8 @@ export class RaceStage implements Stage {
     document.body.append(race.flag.el);
     app.setStage(race);
     // the HTML over the race (the stage itself moves everything on, once a frame)
-    const screen: Screen = { el: race.el };
+    // (the HUD has the top left corner, so no settings gear: they're in the pause menu)
+    const screen: Screen = { el: race.el, gear: false };
     app.show(screen);
     return race;
   }

@@ -12,9 +12,14 @@ interface Prefs {
   cameraMode: CameraMode;
   muted: boolean;
   ghost: boolean;
+  /** sound levels, 0..1: everything, the music, and the effects (engine, crashes, clicks) */
+  volume: number;
+  music: number;
+  effects: number;
 }
 
-const defaults: Prefs = { car: 4, cameraMode: 'thirdPerson', muted: false, ghost: true };
+const defaults: Prefs = { car: 4, cameraMode: 'thirdPerson', muted: false, ghost: true, volume: 1, music: 1, effects: 1 };
+const level = (v: unknown, fallback: number) => (typeof v === 'number' && v >= 0 && v <= 1 ? v : fallback);
 let cache: Prefs | null = null;
 
 function load(): Prefs {
@@ -23,7 +28,10 @@ function load(): Prefs {
     const stored = JSON.parse(localStorage.getItem(KEY) ?? '{}') ?? {};
     const cameraMode: CameraMode = stored.cameraMode === 'firstPerson' || stored.cameraMode === 'thirdPerson'
       ? stored.cameraMode : stored.firstPerson === true ? 'firstPerson' : 'thirdPerson';
-    cache = { ghost: stored.ghost !== false, car: stored.car ?? defaults.car, muted: stored.muted ?? defaults.muted, cameraMode };
+    cache = {
+      ghost: stored.ghost !== false, car: stored.car ?? defaults.car, muted: stored.muted ?? defaults.muted, cameraMode,
+      volume: level(stored.volume, defaults.volume), music: level(stored.music, defaults.music), effects: level(stored.effects, defaults.effects),
+    };
   } catch {
     cache = { ...defaults };
   }
