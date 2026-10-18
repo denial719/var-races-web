@@ -81,15 +81,20 @@ Run them from the repository root with `cargo run -p tools --release -- <step>`:
 
 | Step | Makes |
 |---|---|
+| `circuits` | prints the city circuits' waypoints and start lines for `crates/sim/src/maps.rs`, and checks their shapes |
 | `cities` | Tokyo, New York, Chicago, London, Paris and Taipei, and their CPU cars |
 | `sf` | San Francisco, the Waymo, and the classic map's preview |
 | `sprints` | Summit Sprint, Rush Hour, Rooftop Run, Moon Base and the rover |
 | `arenas` | the Junkyard, Stadium and Ice Rink battle arenas |
 | `garage` | the garage cars (`assets/ui/cars`) |
 | `items` | the item icons (`assets/ui/items`) |
-| `heights` | each map's trees and buildings for the first-person view (`heights.png`) |
+| `heights` | each map's trees and buildings for the first-person view (`heights.png`); `heights . tokyo nyc` does just those maps |
 | `audio` | the music and every sound effect (needs `lame` for the MP3 music) |
 | `pack-masks` | `data/masks/*.bin` from each map's `road_mask.png`; run it after changing a map |
+
+The seven city maps are street circuits shaped like real Formula One circuits: their shapes are in `crates/tools/src/circuits.rs` (San Francisco on the Circuit of the Americas, Tokyo on Marina Bay, New York on Baku, Chicago on Montreal, London on Silverstone, Paris on Paul Ricard, Taipei on the Hungaroring).
+After changing one, run `circuits` and copy what it prints into `maps.rs` (a test checks they match), then repaint the city, `heights` for it and `pack-masks`.
+Each city's landmarks are placed in its painter, and `web/src/render/landmarks.ts` builds the 3D ones on the same spots.
 
 The Python tools make the rest:
 `make_ui.py` draws the gilded panels, `make_speedometer.py` the speedometer, and `make_cars.py` the player and CPU car sprites.
@@ -103,6 +108,7 @@ The Python tools need Pillow, and the fonts also need fonttools, brotli and shap
 - **Server:** Render builds the `Dockerfile` (see `render.yaml`).
   This gives a static binary in an empty image of a few megabytes, which starts in milliseconds.
   It reads `PORT` and `RUST_LOG`; no account credentials or database are required.
+- **Map changes:** a change to a track (its shape, start line or road mask) changes the simulation, so deploy matching browser and server builds together.
 - **Protocol updates:** deploy matching browser and server builds together. Protocol v3 adds CPU count settings and removes the retired game mode messages; older clients must reload. Deploy matching browser and server builds together.
 
 ## Credits

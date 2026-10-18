@@ -5,10 +5,17 @@
 // The map pictures draw the tall ones as a side view rising up the picture from their base, so
 // the 3D model stands on that base and the scenery is told to leave the area clear.
 import * as THREE from 'three';
+import type { MapDef } from '../wasm';
 import { Builder, mix, rgb, shade, vertexColors, type Rgb } from './geom';
 
 /** a map area (x0, y0, x1, y1) where the picture of a landmark is */
 export type Area = [number, number, number, number];
+
+type V2 = [number, number];
+type V3 = [number, number, number];
+
+/** half the road's width plus its walkway, on the city street circuits (crates/tools/src/cities.rs) */
+const STREET_HALF = 46 + 18;
 
 const cos = (deg: number) => Math.cos((deg * Math.PI) / 180);
 const sin = (deg: number) => Math.sin((deg * Math.PI) / 180);
@@ -27,6 +34,80 @@ class Landmarks {
 
   frustum(x: number, y: number, z0: number, z1: number, r0: number, r1: number, c: Rgb): void {
     this.b.frustum(x, y, z0, z1, r0, r1, c);
+  }
+
+  /** a box turned to face angle a (radians): half-length hl along a, half-width hw across */
+  obox(x: number, y: number, z0: number, z1: number, hl: number, hw: number, a: number, c: Rgb): void {
+    const f: V2 = [Math.cos(a), Math.sin(a)], r: V2 = [-f[1], f[0]];
+    const at = (s: number, t: number, z: number): V3 => [x + f[0] * s * hl + r[0] * t * hw, y + f[1] * s * hl + r[1] * t * hw, z];
+    this.b.quad(at(-1, -1, z1), at(1, -1, z1), at(1, 1, z1), at(-1, 1, z1), c);
+    const sides: [number, number, number, number, V2][] = [[1, -1, 1, 1, f], [1, 1, -1, 1, r], [-1, 1, -1, -1, [-f[0], -f[1]]], [-1, -1, 1, -1, [-r[0], -r[1]]]];
+    for (const [s0, t0, s1, t1, n] of sides) {
+      this.b.quad(at(s0, t0, z0), at(s1, t1, z0), at(s1, t1, z1), at(s0, t0, z1), shade(c, 0.74 + 0.15 * n[0] + 0.06 * n[1]));
+    }
+  }
+
+  /** a square beam t thick from point p to point q (cables, girders, rods) */
+  beam(p: V3, q: V3, t: number, c: Rgb): void {
+    const d: V3 = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+    const len = Math.hypot(...d);
+    if (len < 0.01) return;
+    // two directions square to the beam
+    let u: V3 = Math.abs(d[2]) / len > 0.9 ? [1, 0, 0] : [-d[1], d[0], 0];
+    const ul = Math.hypot(...u);
+    u = [(u[0] / ul) * t / 2, (u[1] / ul) * t / 2, (u[2] / ul) * t / 2];
+    let w: V3 = [d[1] * u[2] - d[2] * u[1], d[2] * u[0] - d[0] * u[2], d[0] * u[1] - d[1] * u[0]];
+    const wl = Math.hypot(...w);
+    w = [(w[0] / wl) * t / 2, (w[1] / wl) * t / 2, (w[2] / wl) * t / 2];
+    const corner = (o: V3, su: number, sw: number): V3 => [o[0] + u[0] * su + w[0] * sw, o[1] + u[1] * su + w[1] * sw, o[2] + u[2] * su + w[2] * sw];
+    const ring: [number, number][] = [[1, 1], [-1, 1], [-1, -1], [1, -1]];
+    for (let i = 0; i < 4; i++) {
+      const [a0, b0] = ring[i], [a1, b1] = ring[(i + 1) % 4];
+      this.b.quad(corner(p, a0, b0), corner(q, a0, b0), corner(q, a1, b1), corner(p, a1, b1), shade(c, i % 2 ? 0.8 : 1));
+    }
+  }
+
+  /**
+   * A suspension bridge carrying the track over the water between points `from` and `to` (on
+   * the track, in driving order): towers at the given shares of the way across, a main cable
+   * each side sagging between them, and suspender ropes down to the deck.
+   */
+  suspensionBridge(map: MapDef, from: V2, to: V2, towers: number[], top: number, c: Rgb, dark: Rgb): void {
+    const [a, b] = [nearestWaypoint(map, from), nearestWaypoint(map, to)];
+    const dir = Math.atan2(b[1] - a[1], b[0] - a[0]);
+    const f: V2 = [Math.cos(dir), Math.sin(dir)], r: V2 = [-f[1], f[0]];
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const point = (share: number, side: number): V2 => [a[0] + f[0] * len * share + r[0] * side, a[1] + f[1] * len * share + r[1] * side];
+    const legs = STREET_HALF + 14;
+    for (const share of towers) {
+      for (const side of [-1, 1]) {
+        const [x, y] = point(share, side * legs);
+        this.obox(x, y, 0, top, 9, 7, dir, c);
+      }
+      for (const z of [top * 0.22, top * 0.55, top * 0.95]) {
+        const [x, y] = point(share, 0);
+        this.obox(x, y, z, z + 8, 5, legs, dir, dark);
+      }
+    }
+    // the main cables: from the shore up to each tower and sagging between them
+    const stops = [0, ...towers, 1];
+    for (const side of [-1, 1]) {
+      for (let span = 0; span + 1 < stops.length; span++) {
+        const s0 = stops[span], s1 = stops[span + 1];
+        const steps = Math.max(2, Math.floor(((s1 - s0) * len) / 14));
+        const height = (t: number) => {
+          if (span === 0) return 8 + (top - 8) * t * t;
+          if (span === stops.length - 2) return 8 + (top - 8) * (1 - t) * (1 - t);
+          return 16 + (top - 16) * Math.pow(2 * t - 1, 2);
+        };
+        for (let k = 0; k < steps; k++) {
+          const t0 = k / steps, t1 = (k + 1) / steps;
+          const p0 = point(s0 + (s1 - s0) * t0, side * (STREET_HALF + 4)), p1 = point(s0 + (s1 - s0) * t1, side * (STREET_HALF + 4));
+          this.beam([p0[0], p0[1], height(t0)], [p1[0], p1[1], height(t1)], 1.6, c);
+          if (k % 2 === 0) this.beam([p0[0], p0[1], 4], [p0[0], p0[1], height(t0)], 0.5, c);
+        }
+      }
+    }
   }
 
   /** a square tower block, with window bands if asked */
@@ -109,6 +190,419 @@ class Landmarks {
     b.quad([x0, cy - h, z0 + h], [x1, cy - h, z1 + h], [x1, cy + h, z1 + h], [x0, cy + h, z0 + h], c);
     b.quad([x0, cy - h, z0 - h], [x1, cy - h, z1 - h], [x1, cy - h, z1 + h], [x0, cy - h, z0 + h], shade(c, 0.7));
     b.quad([x1, cy + h, z1 - h], [x0, cy + h, z0 - h], [x0, cy + h, z0 + h], [x1, cy + h, z1 + h], shade(c, 0.85));
+  }
+
+  // ---------------------------------------------------------------- across the track
+
+  /** where the track passes nearest `at`, and which way it runs there (radians) */
+  private trackAt(map: MapDef, at: V2): { x: number; y: number; dir: number } {
+    const w = map.waypoints as V2[];
+    let i = 0;
+    for (let k = 1; k < w.length; k++) if (Math.hypot(w[k][0] - at[0], w[k][1] - at[1]) < Math.hypot(w[i][0] - at[0], w[i][1] - at[1])) i = k;
+    const a = w[(i + w.length - 1) % w.length], b = w[(i + 1) % w.length];
+    return { x: w[i][0], y: w[i][1], dir: Math.atan2(b[1] - a[1], b[0] - a[0]) };
+  }
+
+  /** a point `along` the track and `across` it (left of travel) from a place on it */
+  private off(p: { x: number; y: number; dir: number }, along: number, across: number): V2 {
+    return [p.x + Math.cos(p.dir) * along - Math.sin(p.dir) * across, p.y + Math.sin(p.dir) * along + Math.cos(p.dir) * across];
+  }
+
+  /** a big red torii standing over the road */
+  torii(map: MapDef, at: V2): void {
+    const p = this.trackAt(map, at), red = rgb(0xd8342c), black = rgb(0x2a2a30), legs = STREET_HALF + 8;
+    for (const side of [-1, 1]) {
+      const [x, y] = this.off(p, 0, side * legs);
+      this.frustum(x, y, 0, 70, 4.5, 3.6, red);
+      this.frustum(x, y, 0, 5, 6, 6, black);
+    }
+    const [cx, cy] = this.off(p, 0, 0);
+    this.obox(cx, cy, 56, 62, 4, legs + 4, p.dir, red);
+    this.obox(cx, cy, 70, 74, 5, legs + 16, p.dir, red);
+    this.obox(cx, cy, 74, 78, 6, legs + 20, p.dir, black);
+  }
+
+  /** one of Brooklyn Bridge's granite towers over the road, the road running through its arch */
+  brooklynTower(map: MapDef, at: V2): void {
+    const p = this.trackAt(map, at), stone = rgb(0xd6c6a3), dark = rgb(0x9a8a6a), legs = STREET_HALF + 4;
+    for (const side of [-1, 1]) {
+      const [x, y] = this.off(p, 0, side * legs);
+      this.obox(x, y, 0, 120, 10, 12, p.dir, stone);
+    }
+    const [cx, cy] = this.off(p, 0, 0);
+    this.obox(cx, cy, 80, 130, 10, legs + 12, p.dir, stone);
+    this.obox(cx, cy, 130, 134, 11, legs + 13, p.dir, dark);
+    // the cables fanning down from the tower top
+    for (const side of [-1, 1]) {
+      const [x, y] = this.off(p, 0, side * (legs + 6));
+      for (const along of [-160, 160]) {
+        const [ex, ey] = this.off(p, along, side * (legs + 6));
+        this.beam([x, y, 126], [ex, ey, 10], 1.4, rgb(0x6f6a62));
+      }
+    }
+  }
+
+  /** Tower Bridge: two stone towers astride the road with spires, and the blue high walkways */
+  towerBridgeAt(map: MapDef, at: V2): void {
+    const p = this.trackAt(map, at), stone = rgb(0xd6c6a3), blue = rgb(0x4f7fbf), slate = rgb(0x6d7b88);
+    const legs = STREET_HALF + 12;
+    for (const along of [-40, 40]) {
+      for (const side of [-1, 1]) {
+        const [x, y] = this.off(p, along, side * legs);
+        this.obox(x, y, 0, 105, 18, 14, p.dir, stone);
+        this.frustum(x, y, 105, 128, 13, 2, slate);
+      }
+      const [cx, cy] = this.off(p, along, 0);
+      this.obox(cx, cy, 64, 105, 18, legs, p.dir, stone);
+    }
+    for (const side of [-1, 1]) {
+      const [x, y] = this.off(p, 0, side * legs);
+      this.obox(x, y, 92, 100, 26, 6, p.dir, blue);
+    }
+  }
+
+  /** the L: Chicago's elevated railway on its steel posts, crossing over the road */
+  elevatedRail(map: MapDef, at: V2): void {
+    const p = this.trackAt(map, at), steel = rgb(0x3a3c42), reach = STREET_HALF + 90;
+    const across = p.dir + Math.PI / 2;
+    for (const side of [-1, 1]) {
+      for (const k of [1, 2]) {
+        const [x, y] = this.off(p, 0, side * (STREET_HALF + 8 + (k - 1) * 70));
+        for (const along of [-14, 14]) {
+          const [px, py] = this.off({ x, y, dir: p.dir }, along, 0);
+          this.frustum(px, py, 0, 34, 1.6, 1.6, steel);
+        }
+      }
+    }
+    const [cx, cy] = this.off(p, 0, 0);
+    this.obox(cx, cy, 34, 40, reach, 18, across, rgb(0x5a3a22));
+    this.obox(cx, cy, 40, 43, reach, 16, across, rgb(0x8d8f96));
+    // a train passing over
+    this.obox(cx, cy, 43, 56, 70, 9, across, rgb(0xc9ccd2));
+    this.obox(cx, cy, 49, 52, 70.5, 9.5, across, rgb(0x3f6fbf));
+  }
+
+  /** Pont Alexandre III's four tall pylons with gilded horses, at each end of the bridge */
+  alexandre(map: MapDef, at: V2): void {
+    const p = this.trackAt(map, at), stone = rgb(0xd8ceb6), gold = rgb(0xf2c84b);
+    for (const along of [-50, 50]) {
+      for (const side of [-1, 1]) {
+        const [x, y] = this.off(p, along, side * (STREET_HALF + 8));
+        this.frustum(x, y, 0, 60, 6, 5, stone);
+        this.frustum(x, y, 60, 72, 6, 3, gold);
+      }
+    }
+  }
+
+  /**
+   * The things lining a famous stretch of track (from, to, in driving order), standing just
+   * behind the kerbs: neon billboards on posts (Times Square, Shibuya) or night market stalls
+   * under strings of red lanterns.
+   */
+  lining(map: MapDef, from: V2, to: V2, kind: 'neon' | 'lanterns'): void {
+    const path = waypointsBetween(map, from, to);
+    const neon = [rgb(0xff4fa3), rgb(0x3fe0ff), rgb(0xffe23f), rgb(0x8cff5a), rgb(0xff7a3f), rgb(0xb57cff)];
+    path.forEach((p, i) => {
+      if (i === 0 || i === path.length - 1) return;
+      const a = path[i - 1], b = path[i + 1];
+      const dir = Math.atan2(b[1] - a[1], b[0] - a[0]);
+      for (const side of [-1, 1]) {
+        const off = side * (STREET_HALF + 16);
+        const x = p[0] - Math.sin(dir) * off, y = p[1] + Math.cos(dir) * off;
+        if (kind === 'neon') {
+          this.frustum(x, y, 0, 18, 1.2, 1.2, rgb(0x3a3c42));
+          this.obox(x, y, 18, 40, 13, 1.5, dir, neon[(i * 2 + (side > 0 ? 1 : 0)) % neon.length]);
+        } else {
+          this.obox(x, y, 0, 8, 9, 6, dir, rgb(0x7a4a2a));
+          this.obox(x, y, 12, 14, 11, 8, dir, [rgb(0xd9433b), rgb(0x2f8f6a), rgb(0x3b6fd9), rgb(0xe08a2e)][i % 4]);
+          this.frustum(x, y, 8, 12, 0.6, 0.6, rgb(0x5a3a22));
+          this.box(x - 1.5, y - 1.5, 18, x + 1.5, y + 1.5, 22, rgb(0xff5a4a));
+        }
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------- Tokyo
+
+  /** Tokyo Skytree: a slim white lattice tower, two observation decks and a mast */
+  skytree(x: number, y: number): void {
+    this.clearAbove(x, y, 30, 330);
+    const white = rgb(0xe8eef4);
+    this.legsFrustum(x, y, 0, 200, 22, 10, 6, white);
+    this.frustum(x, y, 200, 300, 10, 7, white);
+    this.deck(x, y, 190, 13, 14, rgb(0x46546a), white);
+    this.deck(x, y, 260, 10, 10, rgb(0x46546a), white);
+    this.frustum(x, y, 300, 360, 4, 1.5, rgb(0xd9dde3));
+  }
+
+  /** Senso-ji: the Kaminarimon gate with its red lantern, the hall and the five-storey pagoda */
+  sensoji(x: number, y: number): void {
+    const red = rgb(0xd8342c), roof = rgb(0x3f4f48);
+    this.clear.push([x - 50, y - 30, x + 80, y + 140]);
+    this.box(x - 20, y - 6, 0, x + 20, y + 6, 22, red);
+    this.box(x - 24, y - 9, 22, x + 24, y + 9, 28, roof);
+    this.frustum(x, y, 6, 18, 6, 6, rgb(0xff5a4a));
+    // the hall up the path
+    this.box(x - 30, y + 110, 0, x + 30, y + 140, 24, rgb(0xf1e7d0));
+    this.frustum(x, y + 125, 24, 44, 36, 14, roof);
+    // the pagoda
+    const px = x + 48, py = y + 60;
+    for (let k = 0; k < 5; k++) {
+      const z = k * 16, w = 16 - k * 2;
+      this.box(px - w + 4, py - w + 4, z, px + w - 4, py + w - 4, z + 10, red);
+      this.frustum(px, py, z + 10, z + 16, w + 2, w - 4, roof);
+    }
+    this.frustum(px, py, 80, 100, 2, 1, rgb(0xf2c84b));
+  }
+
+  /** the Imperial Palace's long white halls under green roofs, inside its walls */
+  imperialPalace(x: number, y: number): void {
+    const wall = rgb(0xb9b2a4), roof = rgb(0x3f6f5a), hall = rgb(0xf3eee2);
+    this.clear.push([x - 160, y - 125, x + 160, y + 125]);
+    for (const [a, b, c, d] of [[-150, -110, 150, -102], [-150, 102, 150, 110], [-150, -110, -142, 110], [142, -110, 150, 110]]) {
+      this.box(x + a, y + b, 0, x + c, y + d, 10, wall);
+    }
+    for (const [hx, hy, w] of [[-66 + 39, 36 - 12, 39], [18 + 24, 12 - 12, 24], [-30 + 33, -30 - 12, 33]]) {
+      this.box(x + hx - w, y + hy - 9, 0, x + hx + w, y + hy + 9, 14, hall);
+      this.frustum(x + hx, y + hy, 14, 22, w + 3, w - 6, roof);
+    }
+  }
+
+  /** Tokyo Big Sight: four upside-down pyramids on legs */
+  bigSight(x: number, y: number): void {
+    this.clear.push([x - 110, y - 50, x + 110, y + 50]);
+    for (const [k, dx] of [-72, -24, 24, 72].entries()) {
+      const cy = y + (k % 2 ? -9 : 0);
+      this.frustum(x + dx, cy, 0, 26, 3, 3, rgb(0x6f7a85));
+      this.frustum(x + dx, cy, 26, 62, 6, 26, rgb(0xb8c6d2));
+    }
+  }
+
+  /** the life-size Gundam on Odaiba */
+  gundam(x: number, y: number): void {
+    const white = rgb(0xf3f1ea), blue = rgb(0x2f5fb8), red = rgb(0xd8342c);
+    this.clear.push([x - 20, y - 20, x + 20, y + 50]);
+    this.box(x - 12, y - 8, 0, x + 12, y + 8, 4, rgb(0x8d8f96));
+    for (const dx of [-5, 5]) {
+      this.box(x + dx - 3, y - 3, 4, x + dx + 3, y + 3, 26, white);
+      this.box(x + dx - 3, y - 3, 4, x + dx + 3, y + 3, 8, red);
+    }
+    this.box(x - 9, y - 4, 26, x + 9, y + 4, 34, red);
+    this.box(x - 8, y - 5, 34, x + 8, y + 5, 48, blue);
+    for (const dx of [-12, 12]) this.box(x + dx - 3, y - 3, 30, x + dx + 3, y + 3, 48, white);
+    this.box(x - 4, y - 4, 48, x + 4, y + 4, 56, white);
+    this.box(x - 1, y - 1, 56, x + 1, y + 1, 60, rgb(0xf2c84b));
+  }
+
+  /** Mount Fuji on the horizon, snow on its peak */
+  fuji(x: number, y: number): void {
+    this.frustum(x, y, 0, 260, 900, 120, rgb(0x5b6f94));
+    this.frustum(x, y, 260, 330, 120, 18, rgb(0xf4f6fa));
+  }
+
+  // ---------------------------------------------------------------- New York
+
+  /** a glass skyscraper of stacked tiers: (half width, height, colour) from the ground up */
+  skyscraper(x: number, y: number, tiers: [number, number, Rgb][], spire: number, spireColour: Rgb): void {
+    let z = 0;
+    const widest = Math.max(...tiers.map((t) => t[0]));
+    this.clearAbove(x, y, widest + 8, 260);
+    for (const [r, h, c] of tiers) {
+      this.tower(x, y, r, r, z, z + h, c, true);
+      z += h;
+    }
+    this.frustum(x, y, z, z + spire, 2, 0.8, spireColour);
+  }
+
+  /** the Chrysler Building's terraced steel crown */
+  chrysler(x: number, y: number): void {
+    this.clearAbove(x, y, 30, 220);
+    const brick = rgb(0xd9d4ca), steel = rgb(0xc9ced6);
+    this.tower(x, y, 24, 24, 0, 120, brick, true);
+    let z = 120;
+    for (const r of [18, 14, 10, 7]) {
+      this.frustum(x, y, z, z + 12, r, r - 3, steel);
+      z += 12;
+    }
+    this.frustum(x, y, z, z + 40, 3, 0.5, rgb(0xd9dde3));
+  }
+
+  /** Rockefeller Center's Christmas tree over the rink */
+  rockefellerTree(x: number, y: number): void {
+    this.clear.push([x - 34, y - 24, x + 34, y + 70]);
+    this.box(x - 30, y - 18, 0, x + 30, y + 18, 1, rgb(0xcfe8f4));
+    this.frustum(x, y + 40, 0, 6, 3, 3, rgb(0x5a3a22));
+    this.frustum(x, y + 40, 6, 60, 16, 1, rgb(0x2f6a34));
+    this.frustum(x, y + 40, 60, 66, 3, 0, rgb(0xffe58a));
+  }
+
+  // ---------------------------------------------------------------- Chicago
+
+  /** Marina City's two round corncob towers */
+  marinaCity(x: number, y: number): void {
+    this.clearAbove(x, y, 100, 160);
+    for (const dx of [-72, 72]) {
+      for (let z = 0; z < 140; z += 6) {
+        this.frustum(x + dx, y + 40, z, z + 3, 20, 20, rgb(0xe8e4dc));
+        this.frustum(x + dx, y + 40, z + 3, z + 6, 15, 15, rgb(0x8f8a80));
+      }
+    }
+  }
+
+  /** Buckingham Fountain: tiers of pink granite in a round pool */
+  fountain(x: number, y: number): void {
+    this.clear.push([x - 50, y - 50, x + 50, y + 50]);
+    this.frustum(x, y, 0, 3, 42, 42, rgb(0xd6c6a3));
+    this.frustum(x, y, 3, 4, 38, 38, rgb(0x5aa7c8));
+    this.frustum(x, y, 0, 10, 22, 20, rgb(0xe8b8a8));
+    this.frustum(x, y, 10, 16, 13, 11, rgb(0xe8b8a8));
+    this.frustum(x, y, 16, 30, 2, 0.5, rgb(0xdff2ff));
+  }
+
+  /** a ballpark: a bowl of stands round the field (Wrigley's green ivy walls if `ivy`) */
+  ballpark(x: number, y: number, r: number, seats: Rgb, ivy: boolean): void {
+    this.clear.push([x - r - 20, y - r - 20, x + r + 20, y + r + 20]);
+    for (let k = 0; k < 24; k++) {
+      const a = (k / 24) * Math.PI * 2, hw = (Math.PI * r) / 24 + 1;
+      this.obox(x + Math.cos(a) * r, y + Math.sin(a) * r, 0, 16, 8, hw, a, ivy && k % 2 ? rgb(0x2f7a32) : seats);
+    }
+    for (const a of [0.6, 2.2, 3.8, 5.4]) this.frustum(x + Math.cos(a) * (r + 8), y + Math.sin(a) * (r + 8), 0, 40, 1.6, 1.2, rgb(0xd9dde3));
+  }
+
+  // ---------------------------------------------------------------- London
+
+  /** the Shard: a tall glass shard narrowing to a point */
+  shard(x: number, y: number): void {
+    this.clearAbove(x, y, 48, 240);
+    this.frustum(x, y, 0, 230, 40, 4, rgb(0x9fc4dc));
+    this.frustum(x, y, 230, 250, 4, 0.5, rgb(0xd9e8f2));
+  }
+
+  /** the Gherkin: a rounded glass tower */
+  gherkin(x: number, y: number): void {
+    this.clearAbove(x, y, 30, 160);
+    for (let i = 0; i < 12; i++) {
+      const t0 = i / 12, t1 = (i + 1) / 12;
+      const r = (t: number) => 8 + 18 * Math.sin(Math.PI * (0.15 + 0.75 * t));
+      this.frustum(x, y, t0 * 130, t1 * 130, r(t0), r(t1), i % 2 ? rgb(0x2f5f7a) : rgb(0x4f8fa8));
+    }
+  }
+
+  /** St Paul's Cathedral: the great dome on its drum above the nave */
+  stPauls(x: number, y: number): void {
+    this.clearAbove(x, y, 50, 120);
+    const stone = rgb(0xe8e2d4);
+    this.box(x - 40, y + 10, 0, x + 40, y + 50, 40, stone);
+    this.frustum(x, y + 30, 40, 64, 24, 22, stone);
+    this.frustum(x, y + 30, 64, 84, 22, 10, rgb(0x8a959e));
+    this.frustum(x, y + 30, 84, 100, 3, 1, rgb(0xf2c84b));
+  }
+
+  /** Nelson's Column in Trafalgar Square */
+  nelson(x: number, y: number): void {
+    this.clear.push([x - 20, y - 20, x + 20, y + 20]);
+    this.box(x - 9, y - 9, 0, x + 9, y + 9, 14, rgb(0xb9b2a4));
+    this.frustum(x, y, 14, 130, 4, 3.2, rgb(0xd6c6a3));
+    this.frustum(x, y, 130, 140, 3, 2, rgb(0x5a5c63));
+  }
+
+  /** the Tower of London: the White Tower with its four turrets */
+  whiteTower(x: number, y: number): void {
+    this.clear.push([x - 80, y - 70, x + 80, y + 70]);
+    const stone = rgb(0xeee8da);
+    this.box(x - 27, y - 24, 0, x + 27, y + 30, 44, stone);
+    for (const [dx, dy] of [[-27, -24], [27, -24], [-27, 30], [27, 30]]) this.frustum(x + dx, y + dy, 44, 58, 6, 4, rgb(0x6f8f9a));
+  }
+
+  // ---------------------------------------------------------------- Paris
+
+  /** Les Invalides: the gilded dome on its drum */
+  invalides(x: number, y: number): void {
+    this.clearAbove(x, y, 50, 100);
+    this.box(x - 30, y - 10, 0, x + 30, y + 30, 30, rgb(0xe3dccf));
+    this.frustum(x, y + 10, 30, 52, 20, 18, rgb(0xe8e2d4));
+    this.frustum(x, y + 10, 52, 74, 18, 6, rgb(0xf2c84b));
+    this.frustum(x, y + 10, 74, 96, 2, 0.6, rgb(0xd9a822));
+  }
+
+  /** the obelisk in the Place de la Concorde */
+  obelisk(x: number, y: number): void {
+    this.clear.push([x - 14, y - 14, x + 14, y + 14]);
+    this.box(x - 6, y - 6, 0, x + 6, y + 6, 8, rgb(0xb9b2a4));
+    this.frustum(x, y, 8, 78, 4, 2.6, rgb(0xe8d7b0));
+    this.frustum(x, y, 78, 84, 2.6, 0, rgb(0xf2c84b));
+  }
+
+  /** the Louvre's glass pyramid */
+  louvrePyramid(x: number, y: number): void {
+    this.frustum(x, y + 18, 0, 34, 34, 0.5, rgb(0x9fd3f0));
+  }
+
+  /** the Moulin Rouge: the red windmill on its cabaret */
+  moulinRouge(x: number, y: number): void {
+    this.clearAbove(x, y, 34, 70);
+    const red = rgb(0xd8342c);
+    this.box(x - 30, y, 0, x + 30, y + 24, 20, red);
+    this.box(x - 9, y + 6, 20, x + 9, y + 20, 46, rgb(0xc8302c));
+    for (const a of [45, 135, 225, 315]) {
+      this.beam([x, y + 4, 44], [x + cos(a) * 26, y + 4, 44 + sin(a) * 26], 3, rgb(0xb22a24));
+    }
+  }
+
+  /** Sacre-Coeur: white domes on top of Montmartre */
+  sacreCoeur(x: number, y: number): void {
+    this.clearAbove(x, y, 60, 120);
+    const white = rgb(0xf6f3ea);
+    this.box(x - 40, y + 10, 0, x + 40, y + 60, 34, white);
+    this.frustum(x, y + 35, 34, 70, 18, 4, white);
+    for (const dx of [-28, 28]) this.frustum(x + dx, y + 20, 34, 52, 9, 2, white);
+    this.frustum(x, y + 70, 34, 90, 6, 1, white);
+  }
+
+  // ---------------------------------------------------------------- Taipei
+
+  /** the Grand Hotel: a vast red palace under golden roofs */
+  grandHotel(x: number, y: number): void {
+    this.clearAbove(x, y, 100, 100);
+    const red = rgb(0xc8302c), gold = rgb(0xe8b832);
+    this.box(x - 90, y, 0, x + 90, y + 40, 40, red);
+    this.frustum(x, y + 20, 40, 50, 92, 70, gold);
+    this.box(x - 30, y + 5, 40, x + 30, y + 35, 62, red);
+    this.frustum(x, y + 20, 62, 76, 34, 12, gold);
+  }
+
+  /** the National Palace Museum: a long hall under green-tiled roofs */
+  palaceMuseum(x: number, y: number): void {
+    this.clearAbove(x, y, 80, 70);
+    const cream = rgb(0xf3ead2), green = rgb(0x2f7a4a);
+    this.box(x - 72, y, 0, x + 72, y + 30, 24, cream);
+    this.frustum(x, y + 15, 24, 32, 74, 60, green);
+    this.box(x - 30, y + 4, 32, x + 30, y + 26, 46, cream);
+    this.frustum(x, y + 15, 46, 56, 32, 14, green);
+  }
+
+  /** the Maokong gondola: cabins on a cable over its pylons */
+  gondola(x0: number, y0: number, x1: number, y1: number): void {
+    const steps = 6;
+    let last: V3 | null = null;
+    for (let k = 0; k <= steps; k++) {
+      const t = k / steps, x = x0 + (x1 - x0) * t, y = y0 + (y1 - y0) * t;
+      this.frustum(x, y, 0, 40, 2, 1.5, rgb(0x8d8f96));
+      const top: V3 = [x, y, 40];
+      if (last) {
+        this.beam(last, top, 0.8, rgb(0x3a3c42));
+        const m: V3 = [(last[0] + x) / 2, (last[1] + y) / 2, 32];
+        this.box(m[0] - 4, m[1] - 4, m[2] - 6, m[0] + 4, m[1] + 4, m[2] + 2, k % 2 ? rgb(0x3fae49) : rgb(0xf2c84b));
+      }
+      last = top;
+    }
+  }
+
+  /** the Red House in Ximending: an octagonal red-brick theatre */
+  redHouse(x: number, y: number): void {
+    this.clear.push([x - 30, y - 30, x + 30, y + 30]);
+    this.frustum(x, y, 0, 26, 24, 24, rgb(0xb5523b));
+    this.frustum(x, y, 26, 36, 18, 6, rgb(0x5a5c63));
   }
 
   // ---------------------------------------------------------------- the landmarks
@@ -227,21 +721,6 @@ class Landmarks {
     this.frustum(x, y, 160, 205, 12, 1, rgb(0x5f6e5a));
   }
 
-  /** Tower Bridge: two stone towers over the road with blue walkways across the top */
-  towerBridge(x: number, y0: number, y1: number): void {
-    const stone = rgb(0xd6c6a3), blue = rgb(0x4f7fbf);
-    const inner = 68, outer = 104;
-    for (const ty of [y0, y1]) {
-      for (const side of [-1, 1]) {
-        const a = x + side * inner, bb = x + side * outer;
-        this.box(Math.min(a, bb), ty - 20, 0, Math.max(a, bb), ty + 20, 105, stone);
-        this.frustum((a + bb) / 2, ty, 105, 125, 12, 2, rgb(0x6d7b88));
-      }
-      this.box(x - inner, ty - 20, 60, x + inner, ty + 20, 105, stone);
-    }
-    this.box(x - outer, y0 + 20, 92, x - outer + 14, y1 - 20, 100, blue);
-    this.box(x + outer - 14, y0 + 20, 92, x + outer, y1 - 20, 100, blue);
-  }
 
   /** the Eiffel Tower: four splayed iron legs meeting at the first level, a needle above */
   eiffel(x: number, y: number): void {
@@ -286,31 +765,58 @@ class Landmarks {
   }
 
   /** the Golden Gate: two tall orange towers, main cables and suspender ropes */
-  goldenGate(): void {
-    const orange = rgb(0xc0362c), dark = rgb(0x8f2a22);
-    const deckY = 880, half = 84, legY = half + 14, top = 220;
-    for (const tx of [640, 1160]) {
-      for (const side of [-1, 1]) {
-        const ly = deckY + side * legY;
-        this.tower2(tx - 10, ly - 9, tx + 10, ly + 9, 0, top, orange, false);
-      }
-      for (const z of [40, 110, 170, 212]) this.box(tx - 7, deckY - legY, z, tx + 7, deckY + legY, z + 10, dark);
+  /** the Palace of Fine Arts: an open rotunda of columns under a terracotta dome, and its colonnade */
+  palaceOfFineArts(x: number, y: number): void {
+    const ochre = rgb(0xd28b5a), stone = rgb(0xd9a982);
+    for (let k = 0; k < 8; k++) {
+      const a = (k / 8) * Math.PI * 2;
+      this.frustum(x + Math.cos(a) * 20, y + Math.sin(a) * 20, 0, 34, 2.6, 2.2, stone);
     }
-    // the main cables sag between the towers and down to each shore; ropes hang to the deck
-    const xs = [400, 640, 1160, 1420];
-    for (const side of [-1, 1]) {
-      const cy = deckY + side * (half + 4);
-      for (let span = 0; span < 3; span++) {
-        const a = xs[span], bx = xs[span + 1];
-        const steps = Math.floor((bx - a) / 12);
-        for (let k = 0; k < steps; k++) {
-          const x0 = a + ((bx - a) * k) / steps, x1 = a + ((bx - a) * (k + 1)) / steps;
-          const z0 = cable(span, (x0 - a) / (bx - a), top), z1 = cable(span, (x1 - a) / (bx - a), top);
-          this.plankX(x0, z0, x1, z1, cy, 1.4, orange);
-          if (k % 2 === 0) this.box(x0 - 0.3, cy - 0.3, 6, x0 + 0.3, cy + 0.3, z0, orange);
-        }
-      }
+    this.frustum(x, y, 34, 42, 25, 24, ochre);
+    this.frustum(x, y, 42, 56, 23, 15, ochre);
+    this.frustum(x, y, 56, 63, 15, 6, rgb(0x7f9a8a));
+    this.clear.push([x - 100, y - 50, x + 100, y + 50]);
+    // the colonnade curving round behind it
+    for (let k = 0; k <= 16; k++) {
+      const a = Math.PI * (k / 16);
+      this.frustum(x + Math.cos(a) * 90, y + Math.sin(a) * 42, 0, 20, 2.2, 2, stone);
     }
+  }
+
+  /** Oracle Park: a bowl of stands round the field, and light towers */
+  oraclePark(x: number, y: number): void {
+    const seats = rgb(0x4a4c55), steel = rgb(0xd9dde3);
+    this.clear.push([x - 160, y - 160, x + 160, y + 160]);
+    for (let k = 0; k < 24; k++) {
+      const a = (k / 24) * Math.PI * 2;
+      const r = 138, hw = (Math.PI * r) / 24 + 1;
+      this.obox(x + Math.cos(a) * r, y + Math.sin(a) * r, 0, 18 + (k % 2) * 4, 9, hw, a, k % 3 === 0 ? rgb(0xf08a2e) : seats);
+    }
+    for (const a of [0.4, 1.4, 2.6, 3.8, 5.0]) this.frustum(x + Math.cos(a) * 150, y + Math.sin(a) * 150, 0, 46, 2, 1.5, steel);
+    // the giant Coke bottle behind left field
+    this.frustum(x - 102, y - 90, 0, 26, 7, 4, rgb(0xb5523b));
+  }
+
+  /** the Dragon Gate into Chinatown: red pillars under green tiled roofs */
+  dragonGate(x: number, y: number): void {
+    const red = rgb(0xc8302c), green = rgb(0x3f8f5a);
+    for (const dx of [-30, -12, 12, 30]) this.box(x + dx - 2, y - 2, 0, x + dx + 2, y + 2, Math.abs(dx) > 20 ? 14 : 18, red);
+    this.box(x - 36, y - 5, 14, x - 8, y + 5, 17, green);
+    this.box(x + 8, y - 5, 14, x + 36, y + 5, 17, green);
+    this.box(x - 16, y - 6, 18, x + 16, y + 6, 22, green);
+    this.box(x - 3, y - 2, 22, x + 3, y + 2, 25, rgb(0xf2c84b));
+  }
+
+  /** a cable car halfway along a stretch of track, at the kerb */
+  cableCar(map: MapDef, from: V2, to: V2): void {
+    const path = waypointsBetween(map, from, to);
+    const i = Math.floor(path.length / 2);
+    const a = path[Math.max(0, i - 1)], b = path[Math.min(path.length - 1, i + 1)];
+    const dir = Math.atan2(b[1] - a[1], b[0] - a[0]);
+    const x = path[i][0] - Math.sin(dir) * 21, y = path[i][1] + Math.cos(dir) * 21;
+    this.obox(x, y, 0, 9, 30, 11, dir, rgb(0xc8302c));
+    this.obox(x, y, 9, 11, 30, 11, dir, rgb(0xf2e6c8));
+    this.obox(x, y, 11, 13, 31, 12, dir, rgb(0x8a5a3a));
   }
 
   /** the Transamerica Pyramid: a slender white pyramid with two shoulders */
@@ -331,11 +837,11 @@ class Landmarks {
   }
 
   /** the Ferry Building on the Embarcadero, and its clock tower */
-  ferryBuilding(): void {
-    this.clear.push([1825, 375, 1895, 645]);
-    this.box(1830, 380, 0, 1890, 640, 34, rgb(0xdccdb0));
-    this.box(1832, 382, 34, 1888, 638, 40, rgb(0x9a8a70));
-    const cx = 1860, cy = 510;
+  ferryBuilding(x0: number, y0: number, x1: number, y1: number): void {
+    this.clear.push([x0 - 5, y0 - 5, x1 + 5, y1 + 5]);
+    this.box(x0, y0, 0, x1, y1, 34, rgb(0xdccdb0));
+    this.box(x0 + 2, y0 + 2, 34, x1 - 2, y1 - 2, 40, rgb(0x9a8a70));
+    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
     this.tower(cx, cy, 12, 12, 40, 105, rgb(0xc7b08a), false);
     this.box(cx - 12.5, cy - 6, 85, cx + 12.5, cy + 6, 97, rgb(0xf6f1df));
     this.frustum(cx, cy, 105, 125, 9, 1, rgb(0x2f6f62));
@@ -355,49 +861,110 @@ function halfAt(t: number, base: number, power = 1.6): number {
   return base * Math.pow(1 - t, power) + 3;
 }
 
-/** the cable's height across a span: a sag from tower top to tower top, or down to a shore */
-function cable(span: number, t: number, top: number): number {
-  if (span === 1) return 18 + (top - 18) * Math.pow(2 * t - 1, 2);
-  return span === 0 ? 10 + (top - 10) * t * t : 10 + (top - 10) * (1 - t) * (1 - t);
-}
-
 /** a map's landmarks as one mesh (null if it has none), and the areas they stand on */
-export function buildLandmarks(mapId: string): { mesh: THREE.Mesh | null; clear: Area[] } {
+export function buildLandmarks(map: MapDef): { mesh: THREE.Mesh | null; clear: Area[] } {
   const l = new Landmarks();
-  switch (mapId) {
+  switch (map.id) {
+    // as crates/tools/src/cities.rs paints them
     case 'tokyo':
-      l.tokyoTower(1495, 300);
+      l.suspensionBridge(map, [2010, 1000], [2570, 470], [0.3, 0.7], 170, rgb(0xf3f4f6), rgb(0xb7bec8)); // the Rainbow Bridge
+      l.torii(map, [390, 530]);
+      l.lining(map, [1154, 523], [700, 600], 'neon'); // Shibuya
+      l.tokyoTower(1525, 430);
+      l.skytree(205, 1260);
+      l.sensoji(360, 990);
+      l.imperialPalace(1300, 1050);
+      l.bigSight(2265, 105);
+      l.gundam(2560, 120);
+      l.fuji(-1400, 2900);
       break;
     case 'nyc':
-      l.empireState(560, 420);
-      l.flatiron(1355, 320);
+      l.brooklynTower(map, [1350, 215]);
+      l.brooklynTower(map, [1525, 170]);
+      l.lining(map, [1050, 1300], [620, 1110], 'neon'); // Times Square
+      l.skyscraper(1150, 470, [[30, 138, rgb(0x9fc4dc)], [21, 90, rgb(0xb8d4e6)], [12, 48, rgb(0xcfe2ee)]], 54, rgb(0xd9dde3)); // One World Trade Center
+      l.empireState(1100, 830);
+      l.chrysler(1240, 1010);
+      l.flatiron(820, 510);
+      l.rockefellerTree(910, 1300);
+      l.ferrisWheel(2560, 260, 60, true, rgb(0xd9433b)); // Coney Island's Wonder Wheel
       l.liberty(330, 60);
       break;
     case 'chicago':
-      l.willis(420, 320);
-      l.bean(1300, 440);
-      l.ferrisWheel(1790, 850, 33, true, rgb(0xd9433b));
+      l.elevatedRail(map, [454, 440]);
+      l.willis(700, 1000);
+      l.skyscraper(1080, 1300, [[27, 156, rgb(0x3a3c42)], [21, 18, rgb(0x2a2a30)]], 48, rgb(0xd9dde3)); // the John Hancock Center
+      l.marinaCity(900, 1240);
+      l.bean(1330, 720);
+      l.fountain(1030, 520);
+      l.ballpark(650, 1330, 92, rgb(0x3b6fd9), true); // Wrigley Field
+      l.ballpark(2420, 150, 70, rgb(0x9aa0a8), false); // Soldier Field
+      l.ferrisWheel(2860, 1490, 33, true, rgb(0xd9433b)); // Navy Pier
       break;
     case 'london':
-      l.parliament(360, 520);
-      l.bigBen(330, 515);
-      l.ferrisWheel(1380, 830, 66, true, rgb(0xd9dde3));
-      l.towerBridge(1760, 652, 733);
+      l.towerBridgeAt(map, [1880, 690]);
+      l.parliament(660, 780);
+      l.bigBen(630, 775);
+      l.ferrisWheel(640, 600, 66, true, rgb(0xd9dde3)); // the London Eye
+      l.nelson(1300, 230);
+      l.stPauls(1150, 1200);
+      l.gherkin(1600, 1300);
+      l.shard(2180, 440);
+      l.whiteTower(2150, 900);
       break;
     case 'paris':
-      l.eiffel(1100, 650);
-      l.arc(1430, 370);
+      l.alexandre(map, [953, 574]);
+      l.eiffel(600, 360);
+      l.arc(1600, 1380);
+      l.louvrePyramid(1420, 760);
+      l.obelisk(1090, 650);
+      l.sacreCoeur(360, 1250);
+      l.moulinRouge(560, 1440);
+      l.invalides(1330, 340);
       break;
     case 'taipei':
-      l.taipei101(1540, 760);
+      l.taipei101(1700, 830);
+      l.grandHotel(950, 1420);
+      l.palaceMuseum(1450, 1470);
+      l.gondola(2520, 300, 2840, 820);
+      l.redHouse(360, 220);
+      l.lining(map, [1800, 200], [950, 170], 'lanterns'); // Shilin Night Market
       break;
     case 'sf':
-      l.goldenGate();
-      l.transamerica(1440, 370);
-      l.coit(1588, 555);
-      l.ferryBuilding();
-      l.alcatraz(1000, 1015);
+      // as crates/tools/src/sf.rs paints them
+      l.suspensionBridge(map, [655, 1520], [1700, 1462], [0.27, 0.73], 220, rgb(0xc0362c), rgb(0x8f2a22)); // the Golden Gate
+      l.suspensionBridge(map, [2560, 1010], [2255, 650], [0.3, 0.7], 150, rgb(0xc9ced6), rgb(0x8a929e)); // the Bay Bridge
+      l.transamerica(1950, 700);
+      l.coit(1600, 985);
+      l.ferryBuilding(2400, 518, 2650, 572);
+      l.alcatraz(2690, 1540);
+      l.palaceOfFineArts(450, 1290);
+      l.oraclePark(2430, 240);
+      l.dragonGate(1380, 560);
+      l.cableCar(map, [980, 355], [420, 450]);
       break;
   }
   return { mesh: l.b.empty ? null : l.b.mesh(vertexColors()), clear: l.clear };
+}
+
+/** the waypoint of the map's track nearest to p */
+function nearestWaypoint(map: MapDef, p: V2): V2 {
+  let best: V2 = [p[0], p[1]], d = Infinity;
+  for (const w of map.waypoints as V2[]) {
+    const e = Math.hypot(w[0] - p[0], w[1] - p[1]);
+    if (e < d) [best, d] = [w, e];
+  }
+  return best;
+}
+
+/** the waypoints driven from the one nearest `from` to the one nearest `to` */
+function waypointsBetween(map: MapDef, from: V2, to: V2): V2[] {
+  const w = map.waypoints as V2[];
+  const near = (p: V2) => w.reduce((bi, q, i) => (Math.hypot(q[0] - p[0], q[1] - p[1]) < Math.hypot(w[bi][0] - p[0], w[bi][1] - p[1]) ? i : bi), 0);
+  const out: V2[] = [];
+  for (let i = near(from), k = 0; k < w.length; i = (i + 1) % w.length, k++) {
+    out.push(w[i]);
+    if (i === near(to)) break;
+  }
+  return out;
 }

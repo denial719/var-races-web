@@ -61,6 +61,8 @@ pub struct Driver {
     waypoint: usize,
     lap_count: u8,
     stop_next: bool,
+    /// after the finish: the waypoint it pulls up at, off to one side so the road stays clear
+    stop_at: usize,
     /// done: pulled up past the finish, or wrecked
     pub stopped: bool,
     // the point it's aiming at: the waypoint moved sideways onto its chosen line, plus an extra
@@ -109,6 +111,7 @@ impl Driver {
             waypoint: 0,
             lap_count: 0,
             stop_next: false,
+            stop_at: 1,
             stopped: false,
             target: Vec2::ZERO,
             base_point: Vec2::ZERO,
@@ -262,9 +265,11 @@ impl Driver {
                 self.lap_count += 1;
                 if self.lap_count >= self.laps && !self.endless {
                     self.stop_next = true;
+                    // pull up a few waypoints on, not all in a row across the road
+                    self.stop_at = 2 + rng.below(3);
                 }
             }
-            if self.stop_next && self.waypoint == 1 {
+            if self.stop_next && self.waypoint >= self.stop_at {
                 self.stopped = true;
                 return Input { brake: true, ..Input::default() };
             }
@@ -362,7 +367,10 @@ impl Driver {
         }
         // a car pointed the wrong way slows down to turn around
         desired *= clamp(1.0 - diff.abs() / deg(120.0), 0.35, 1.0);
-        if (self.stop_next && self.waypoint == 1) || (self.sprint && self.waypoint == map.waypoints.len() - 1) {
+        if self.stop_next && self.waypoint >= 1 {
+            desired *= 0.5; // easing up past the finish, over to the side
+        }
+        if self.sprint && self.waypoint == map.waypoints.len() - 1 {
             desired *= (distance / 200.0).max(0.3); // easing up past the finish
         }
         pedals(speed, desired, steer)
@@ -391,6 +399,10 @@ impl Driver {
         let dir = (point - self.point_before(map, self.waypoint)).norm();
         self.line_offset =
             clamp(self.p.line_bias * 14.0 + rng.range(-16.0, 16.0), -MAX_LINE_OFFSET, MAX_LINE_OFFSET);
+        if self.stop_next {
+            // past the finish: over to this CPU's side of the road, out of everyone's way
+            self.line_offset = if self.p.line_bias >= 0.0 { MAX_LINE_OFFSET } else { -MAX_LINE_OFFSET };
+        }
         self.base_point = point;
         self.left_of_travel = dir.perp();
         self.update_target();

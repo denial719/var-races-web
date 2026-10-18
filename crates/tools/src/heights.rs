@@ -16,9 +16,10 @@ const CELL: i32 = 12;
 const ROAD_CLEAR: i32 = 26;
 const GROUND_SHARE: f32 = 0.6;
 
-pub fn make_all(root: &Path) -> Result<(), String> {
+/// every map's heights, or just the maps named in `only`
+pub fn make_all(root: &Path, only: &[String]) -> Result<(), String> {
     // map, what to raise (T trees, B buildings)
-    for map in sim::maps::ALL.iter() {
+    for map in sim::maps::ALL.iter().filter(|m| only.is_empty() || only.iter().any(|id| id == m.id)) {
         let kinds = match map.id {
             "classic" | "summit" => "T",
             "moon" => "",
