@@ -158,7 +158,7 @@ export class ChaseStage implements Stage, View {
         if (performance.now() - this.caughtAt > 800) this.begin();
       }))));
     const el = h('div.screen', { style: { padding: '12px', justifyContent: 'flex-start' } }, h('div', { style: { width: '100%' } }, strip), this.startCard, this.endCard);
-    this.screen = { el };
+    this.screen = { el, gear: false };
 
     this.stopKeys = onKey((k) => {
       if (k === 'Escape') quit();

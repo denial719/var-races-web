@@ -15,12 +15,19 @@ let music: HTMLAudioElement | null = null;
 let musicName: Music | null = null;
 let muted = pref('muted');
 
+/** the sound levels (0..1) the settings adjust */
+export type Level = 'volume' | 'music' | 'effects';
+const levels: Record<Level, number> = { volume: pref('volume'), music: pref('music'), effects: pref('effects') };
+
+const musicVolume = () => (muted ? 0 : MUSIC_VOLUME * levels.volume * levels.music);
+const effectsVolume = () => (muted ? 0 : levels.volume * levels.effects);
+
 function context(): AudioContext | null {
   if (!ctx) {
     try {
       ctx = new AudioContext();
       master = ctx.createGain();
-      master.gain.value = muted ? 0 : 1;
+      master.gain.value = effectsVolume();
       master.connect(ctx.destination);
     } catch {
       return null;
@@ -79,7 +86,7 @@ export function playMusic(name: Music, loop = true): void {
   stopMusic();
   music = new Audio(asset(`audio/${name}.mp3`));
   music.loop = loop;
-  music.volume = muted ? 0 : MUSIC_VOLUME;
+  music.volume = musicVolume();
   musicName = name;
   void music.play().catch(() => {});
 }
@@ -104,9 +111,24 @@ export function isMuted(): boolean {
 export function setMuted(value: boolean): void {
   muted = value;
   setPref('muted', value);
-  if (music) music.volume = muted ? 0 : MUSIC_VOLUME;
-  if (ctx) master.gain.value = muted ? 0 : 1;
+  apply();
   if (!muted) unlock();
+}
+
+export function getLevel(which: Level): number {
+  return levels[which];
+}
+
+export function setLevel(which: Level, value: number): void {
+  levels[which] = Math.max(0, Math.min(1, value));
+  setPref(which, levels[which]);
+  apply();
+}
+
+/** the music and the effects at the current levels */
+function apply(): void {
+  if (music) music.volume = musicVolume();
+  if (ctx) master.gain.value = effectsVolume();
 }
 
 /**

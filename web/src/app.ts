@@ -4,6 +4,7 @@
 import * as audio from './audio';
 import { onKey } from './input';
 import { Renderer, type View } from './render/renderer';
+import { closeSettings, settingsGear } from './ui/settings';
 
 /** something moving in the canvas */
 export interface Stage {
@@ -16,6 +17,8 @@ export interface Stage {
 /** the HTML over the canvas */
 export interface Screen {
   readonly el: HTMLElement;
+  /** false where the top left corner is the screen's own (a race's HUD): no settings gear */
+  readonly gear?: false;
   /** called every frame while it's showing */
   frame?(delta: number): void;
   dispose?(): void;
@@ -56,7 +59,9 @@ class App {
   show(screen: Screen): void {
     this.screen?.dispose?.();
     this.screen = screen;
+    closeSettings();
     this.ui.replaceChildren(screen.el);
+    if (screen.gear !== false) this.ui.append(settingsGear());
     document.body.classList.toggle('menu-muted', screen.el.classList.contains('frosted'));
     this.fit();
     // cards that fill in later (rooms, levels) may grow, so look again once they have

@@ -232,6 +232,8 @@ function noise(r: number, g: number, b: number): HTMLCanvasElement {
 
 export class ParkingScreen implements Screen {
   readonly el: HTMLElement;
+  /** its strip runs across the top while parking: no settings gear */
+  readonly gear = false;
   /** nothing in the WebGL world: the lot is drawn on a canvas of its own */
   readonly stage: Stage | null = null;
   private readonly levels = buildLevels();
