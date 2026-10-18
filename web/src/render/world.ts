@@ -215,7 +215,7 @@ export class World {
 
   /** Scenery is required by both camera modes. */
   private async addScenery(): Promise<void> {
-    const { mesh, clear } = buildLandmarks(this.map.id);
+    const { mesh, clear } = buildLandmarks(this.map);
     if (mesh) {
       liftAll(mesh);
       this.environment.add(mesh);

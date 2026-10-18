@@ -2,25 +2,28 @@
 //! view (buildings show their roof and their front, trees have round canopies and a trunk,
 //! grass has tufts and flowers), plus each city's CPU car sprite and the map previews.
 //!
-//! Like San Francisco (sf.rs), each map is 1920 x 1080 painted at 1/3 size (640 x 360 art
-//! pixels) and scaled up 3x. Every map starts the same way: the last straight comes in along
+//! Like San Francisco (sf.rs), each map is 2880 x 1620 painted and stored at 1/3 size (960 x 540
+//! art pixels) and scaled up 3x in the game. The road follows the city's circuit (circuits.rs). Every map starts the same way: the last straight comes in along
 //! y = 230, turns up at x = 200 and crosses the checkered line at y = 300. Coordinates are world
 //! coordinates (y up) unless they're called ax / ay (art pixels, y down).
 
 use std::f64::consts::PI;
 use std::path::Path;
 
+use crate::circuits::{Field, Line};
 use crate::image::{blend, rgb, Picture};
 use crate::jrand::{round, JRandom};
 
-pub const W: i32 = 1920;
-pub const H: i32 = 1080;
+pub const W: i32 = 2880;
+pub const H: i32 = 1620;
 pub const S: i32 = 3;
 pub const AW: i32 = W / S;
 pub const AH: i32 = H / S;
 /// half the road's width, and the sidewalk beside it (the drivable run-off)
-pub const ROAD: i32 = 64;
-pub const WALK: i32 = 20;
+pub const ROAD: i32 = 46;
+pub const WALK: i32 = 18;
+/// how sharply the line has to turn to count as a corner (radians per map pixel)
+pub const CORNER: f64 = 0.0035;
 
 // the shared palette
 pub const OUTLINE: u32 = rgb(0x2a1d1a);
@@ -57,9 +60,28 @@ const CHI_GLASS: [u32; 5] = [rgb(0x5a5d66), rgb(0x8a7a6a), rgb(0x9cb0c0), rgb(0x
 const TAIPEI_CONCRETE: [u32; 4] = [rgb(0xd8d2c6), rgb(0xc9c3b6), rgb(0xe3dccf), rgb(0xbfc6c9)];
 const AWNINGS: [u32; 4] = [rgb(0xd9433b), rgb(0x2f8f6a), rgb(0x3b6fd9), rgb(0xe08a2e)];
 
-/// the racing line of a map, from sim::maps (the last point is the start line)
-pub fn racing_line(id: &str) -> Vec<[i32; 2]> {
-    sim::maps::get(id).waypoints.iter().map(|&(x, y)| [x as i32, y as i32]).collect()
+/// Writes a city map: the picture and road mask at art size (the map is stored at 1/3 scale,
+/// like the sprints), and the map picker's preview. `road` says if world point (x, y) is road.
+pub fn save_map(root: &Path, folder: &str, art: &[u32], road: impl Fn(i32, i32) -> bool) -> Result<(), String> {
+    let dir = root.join(format!("assets/maps/{folder}"));
+    let mut map = Picture::new(AW as usize, AH as usize);
+    map.pixels.copy_from_slice(art);
+    map.save(dir.join("background.png"), true)?;
+    let mut mask = Picture::new(AW as usize, AH as usize);
+    for ay in 0..AH {
+        for ax in 0..AW {
+            mask.set(ax as usize, ay as usize, if road(ax * S + S / 2, H - ay * S - S / 2) { 0xffffffff } else { 0xff000000 });
+        }
+    }
+    mask.save(dir.join("road_mask.png"), false)?;
+    // the preview: 384 x 216, each pixel the average of a 5 x 5 block of a 1920 x 1080 copy
+    let mut big = Picture::new(1920, 1080);
+    for y in 0..1080 {
+        for x in 0..1920 {
+            big.set(x, y, art[(y * AH as usize / 1080) * AW as usize + x * AW as usize / 1920]);
+        }
+    }
+    big.shrink(384, 216).save(dir.join("preview.png"), false)
 }
 
 fn sin(v: f64) -> f64 {
@@ -76,13 +98,53 @@ fn sq(v: f64) -> f64 {
 
 /// one map being painted
 struct City {
-    path: Vec<[i32; 2]>,
+    line: Line,
+    field: Field,
     water: Box<dyn Fn(i32, i32) -> bool>,
     art: Vec<u32>,
     reserved: Vec<bool>,
     rnd: JRandom,
     water_color: u32,
     water_dark: u32,
+    /// named stretches of track and how they're dressed (red tarmac, cobbles, trees...)
+    dress: Vec<(Vec<bool>, Dress)>,
+    /// bridges coloured differently from the city's usual railings: a point on the bridge, and
+    /// its railing colours
+    special_bridges: Vec<([f64; 2], u32, u32)>,
+}
+
+/// how a famous stretch of road is dressed
+#[derive(Clone, Copy, PartialEq)]
+enum Dress {
+    /// red tarmac (London's Mall)
+    Red,
+    /// grey cobbles or setts (the Champs-Elysees)
+    Cobbles,
+    /// lined with trees both sides
+    Trees,
+    /// lined with cherry trees in blossom
+    Cherry,
+    /// lined with neon billboards (Times Square, Shibuya)
+    Neon,
+    /// lined with food stalls and red lanterns (a night market)
+    Lanterns,
+}
+
+/// something standing across the road at one point of the track
+#[derive(Clone, Copy, PartialEq)]
+pub enum Gate {
+    /// a big red torii
+    Torii,
+    /// Brooklyn Bridge's granite towers with their pointed arches
+    Brooklyn,
+    /// Tower Bridge's two towers, joined by the high walkways
+    TowerBridge,
+    /// the Rainbow Bridge's white towers
+    Rainbow,
+    /// the L: Chicago's elevated railway crossing over the road
+    ElevatedRail,
+    /// Pont Alexandre III's tall pylons topped with gilded horses
+    Alexandre,
 }
 
 type Painter = fn() -> City;
@@ -108,34 +170,33 @@ pub fn paint_all(root: &Path) -> Result<(), String> {
 
 impl City {
     fn new(id: &str, water: impl Fn(i32, i32) -> bool + 'static, seed: i64) -> City {
+        let line = Line::for_map(id);
         City {
-            path: racing_line(id),
+            field: Field::new(&line),
+            line,
             water: Box::new(water),
             art: vec![0; (AW * AH) as usize],
             reserved: vec![false; (AW * AH) as usize],
             rnd: JRandom::new(seed),
             water_color: WATER,
             water_dark: WATER_DARK,
+            dress: Vec::new(),
+            special_bridges: Vec::new(),
         }
     }
 
+    /// dresses the stretch of track driven from `from` to `to`
+    fn dress(&mut self, from: [f64; 2], to: [f64; 2], d: Dress) {
+        let on = self.line.stretch(from, to);
+        self.dress.push((on, d));
+    }
+
+    fn dress_at(&self, i: usize) -> Option<Dress> {
+        self.dress.iter().find(|(on, _)| on[i]).map(|&(_, d)| d)
+    }
+
     fn save(&self, root: &Path, folder: &str) -> Result<(), String> {
-        let dir = root.join(format!("assets/maps/{folder}"));
-        let mut map = Picture::new(W as usize, H as usize);
-        for y in 0..H {
-            for x in 0..W {
-                map.set(x as usize, y as usize, self.art[((y / S) * AW + x / S) as usize]);
-            }
-        }
-        map.save(dir.join("background.png"), true)?;
-        let mut mask = Picture::new(W as usize, H as usize);
-        for y in 0..H {
-            for x in 0..W {
-                mask.set(x as usize, y as usize, if self.road_distance(x, H - y) <= ROAD { 0xffffffff } else { 0xff000000 });
-            }
-        }
-        mask.save(dir.join("road_mask.png"), false)?;
-        map.shrink(384, 216).save(dir.join("preview.png"), false)
+        save_map(root, folder, &self.art, |x, y| self.road_distance(x, y) <= ROAD)
     }
 
     // ================================================================== pixels
@@ -176,16 +237,35 @@ impl City {
 
     // ================================================================== geometry
 
+    /// how far (x, y) is from the circuit's centre line
     fn road_distance(&self, x: i32, y: i32) -> i32 {
-        let mut best = i32::MAX;
-        let n = self.path.len();
-        for i in 0..n {
-            let (a, b) = (self.path[i], self.path[(i + 1) % n]);
-            let dx = (a[0].min(b[0]) - x).max(x - a[0].max(b[0])).max(0);
-            let dy = (a[1].min(b[1]) - y).max(y - a[1].max(b[1])).max(0);
-            best = best.min(dx.max(dy));
+        self.field.distance(x, y)
+    }
+
+    /// the art pixel `off` to the left of the centre line at sample i (negative: to the right)
+    fn beside(&self, i: usize, off: f64) -> (i32, i32) {
+        let (p, t) = (self.line.points[i], self.line.tangent(i));
+        let (x, y) = (p[0] - t[1] * off, p[1] + t[0] * off);
+        (x as i32, y as i32)
+    }
+
+    /// the stretches of the lap that run fairly straight: (first sample, sample count)
+    fn straights(&self) -> Vec<(usize, usize)> {
+        let n = self.line.len();
+        // start counting just after a corner, so a straight isn't split where the loop closes
+        let first = (0..n).find(|&i| self.line.curve[i].abs() >= CORNER).unwrap_or(0);
+        let mut out = Vec::new();
+        let mut run: Option<(usize, usize)> = None;
+        for k in 1..=n {
+            let i = (first + k) % n;
+            if self.line.curve[i].abs() < CORNER {
+                run = Some(run.map_or((i, 1), |(a, len)| (a, len + 1)));
+            } else if let Some(r) = run.take() {
+                out.push(r);
+            }
         }
-        best
+        out.extend(run);
+        out
     }
 
     fn is_water(&self, x: i32, y: i32) -> bool {
@@ -746,16 +826,25 @@ impl City {
                 let d = self.road_distance(x, y);
                 let over_water = self.is_water(x, y) || self.near_water(x, y, 6);
                 if d <= ROAD {
+                    let (i, side) = self.field.nearest(x, y);
+                    let k = self.line.curve[i];
                     let c = if d > ROAD - S {
                         CURB
-                    } else if (ax * 5 + ay * 3) % 17 == 0 {
-                        ASPHALT_SPECK
                     } else {
-                        ASPHALT
+                        match self.dress_at(i) {
+                            Some(Dress::Red) => if (ax * 5 + ay * 3) % 13 == 0 { rgb(0x9a4434) } else { rgb(0xb5523b) },
+                            Some(Dress::Cobbles) => {
+                                if ay % 2 == 0 && (ax + ay / 2) % 2 == 0 { rgb(0x6f6c68) } else if (ax + ay) % 5 == 0 { rgb(0x9a968e) } else { rgb(0x86827b) }
+                            }
+                            _ => if (ax * 5 + ay * 3) % 17 == 0 { ASPHALT_SPECK } else { ASPHALT },
+                        }
                     };
                     self.set(ax, ay, c);
-                    // a white edge line just inside the curb
-                    if d > ROAD - 3 * S && d <= ROAD - 2 * S && !over_water {
+                    if d > ROAD - 3 * S && d <= ROAD - S && k.abs() > CORNER && (k.signum() as i32) == side {
+                        // a red and white kerb on the inside of the corner
+                        self.set(ax, ay, if (i / 2) % 2 == 0 { rgb(0xd9433b) } else { WHITE });
+                    } else if d > ROAD - 3 * S && d <= ROAD - 2 * S && !over_water {
+                        // a white edge line just inside the curb
                         self.set(ax, ay, rgb(0xd8d4ca));
                     }
                 } else if d <= ROAD + WALK && !over_water {
@@ -766,61 +855,183 @@ impl City {
             }
         }
         // street furniture along the fence line: lamps, and vending machines or hydrants
-        for i in 0..self.path.len() - 1 {
-            let (a, b) = (self.path[i], self.path[i + 1]);
-            let len = (b[0] - a[0]).abs() + (b[1] - a[1]).abs();
-            let (dir_x, dir_y) = ((b[0] - a[0]).signum(), (b[1] - a[1]).signum());
-            let mut t = ROAD + 40;
-            while t < len - ROAD - 40 {
-                for side in [-1, 1] {
-                    let x = a[0] + dir_x * t + side * dir_y * (ROAD + WALK + 8);
-                    let y = a[1] + dir_y * t - side * dir_x * (ROAD + WALK + 8);
-                    if !self.free(x, y) {
-                        continue;
-                    }
-                    let (ax, ay) = (x / S, (H - y) / S);
-                    if (t / 66) % 3 == 0 {
-                        self.lamp(ax, ay);
-                    } else if tokyo && (t / 66) % 3 == 1 {
-                        self.vending(ax, ay);
-                    } else if !tokyo && (t / 66) % 3 == 1 {
-                        self.hydrant(ax, ay);
-                    }
+        let n = self.line.len();
+        let mut i = 0;
+        while i < n {
+            for side in [-1.0, 1.0] {
+                let (x, y) = self.beside(i, side * (ROAD + WALK + 8) as f64);
+                if !self.free(x, y) {
+                    continue;
                 }
-                t += 66;
+                let (ax, ay) = (x / S, (H - y) / S);
+                match (i / 11) % 3 {
+                    0 => self.lamp(ax, ay),
+                    1 if tokyo => self.vending(ax, ay),
+                    1 => self.hydrant(ax, ay),
+                    _ => {}
+                }
             }
+            i += 11;
         }
-        // a dashed lane line down the middle of every straight
-        for i in 0..self.path.len() - 1 {
-            let (a, b) = (self.path[i], self.path[i + 1]);
-            let len = (b[0] - a[0]).abs() + (b[1] - a[1]).abs();
-            let mut t = ROAD + 30;
-            while t < len - ROAD - 30 {
-                let x = a[0] + (b[0] - a[0]).signum() * t;
-                let y = a[1] + (b[1] - a[1]).signum() * t;
-                if (t / 18) % 2 == 0 {
-                    self.set(x / S, (H - y) / S, lane_color);
-                    if !tokyo {
-                        // New York: a double yellow line
-                        let vertical = a[0] == b[0];
-                        self.set(x / S + vertical as i32, (H - y) / S + (!vertical) as i32, lane_color);
-                    }
+        // a dashed lane line down the middle of the straights (a double line in New York)
+        for (a, len) in self.straights() {
+            for k in 4..len.saturating_sub(4) {
+                let i = (a + k) % n;
+                let p = self.line.points[i];
+                if (k / 3) % 2 == 1 || self.line.near_start(p[0], p[1]) {
+                    continue;
                 }
-                t += S;
+                for off in if tokyo { [0.0, 0.0] } else { [-2.0, 2.0] } {
+                    let (x, y) = self.beside(i, off);
+                    self.set(x / S, (H - y) / S, lane_color);
+                }
             }
             // a manhole now and then
-            let mut t = ROAD + 90;
-            while t < len - ROAD - 30 {
-                let x = a[0] + (b[0] - a[0]).signum() * t + 30;
-                let y = a[1] + (b[1] - a[1]).signum() * t + 30;
-                let (ax, ay) = (x / S, (H - y) / S);
+            let mut k = 20;
+            while k + 10 < len {
+                let (x, y) = self.beside((a + k) % n, 22.0);
                 if self.road_distance(x, y) < ROAD - 12 && !self.is_water(x, y) {
+                    let (ax, ay) = (x / S, (H - y) / S);
                     self.set(ax, ay, rgb(0x3a3c42));
                     self.set(ax + 1, ay, rgb(0x5a5c63));
                     self.set(ax, ay + 1, rgb(0x5a5c63));
                     self.set(ax + 1, ay + 1, rgb(0x3a3c42));
                 }
-                t += 240;
+                k += 40;
+            }
+        }
+    }
+
+    /// the things lining the dressed stretches: trees, neon billboards, stalls and lanterns
+    fn dressing(&mut self) {
+        let n = self.line.len();
+        for k in 0..self.dress.len() {
+            let d = self.dress[k].1;
+            let step = match d {
+                Dress::Trees | Dress::Cherry => 6,
+                Dress::Neon => 4,
+                Dress::Lanterns => 3,
+                Dress::Red | Dress::Cobbles => 9,
+            };
+            let mut i = 0;
+            while i < n {
+                if self.dress[k].0[i] {
+                    for side in [-1.0, 1.0] {
+                        let (x, y) = self.beside(i, side * (ROAD + WALK + 12) as f64);
+                        if self.road_distance(x, y) <= ROAD + WALK + S || self.is_water(x, y) {
+                            continue;
+                        }
+                        let (ax, ay) = (x / S, (H - y) / S);
+                        match d {
+                            Dress::Trees => self.tree(ax, ay, false),
+                            Dress::Cherry => self.tree(ax, ay, true),
+                            Dress::Red | Dress::Cobbles => self.lamp(ax, ay),
+                            Dress::Neon => self.billboard(ax, ay, i),
+                            Dress::Lanterns => self.stall(ax, ay, i),
+                        }
+                    }
+                }
+                i += step;
+            }
+        }
+    }
+
+    /// a glowing billboard on a post
+    fn billboard(&mut self, ax: i32, ay: i32, i: usize) {
+        let (a, b) = (NEON[i % NEON.len()], NEON[(i / 3 + 2) % NEON.len()]);
+        for dy in -9i32..=-2 {
+            for dx in -3i32..=3 {
+                let edge = dx.abs() == 3 || dy == -9 || dy == -2;
+                self.set(ax + dx, ay + dy, if edge { OUTLINE } else if (dy + dx.abs()) % 3 == 0 { b } else { a });
+            }
+        }
+        self.set(ax, ay - 1, rgb(0x3d3f46));
+        self.set(ax, ay, rgb(0x3d3f46));
+        self.shade(ax + 4, ay, 0.7);
+    }
+
+    /// a night market stall: a striped awning, a counter, and a red lantern
+    fn stall(&mut self, ax: i32, ay: i32, i: usize) {
+        let awning = AWNINGS[i % AWNINGS.len()];
+        for dy in -5i32..=0 {
+            for dx in -3i32..=3 {
+                let c = if dy <= -3 {
+                    if (dx + 3) % 2 == 0 { awning } else { WHITE }
+                } else if dy == 0 {
+                    rgb(0x7a4a2a)
+                } else {
+                    rgb(0xf2d29a)
+                };
+                self.set(ax + dx, ay + dy, c);
+            }
+        }
+        self.outline(ax - 3, ay - 5, 7, 6);
+        self.set(ax + 4, ay - 6, rgb(0xff5a4a));
+        self.set(ax + 4, ay - 5, rgb(0xd8342c));
+    }
+
+    /// something standing across the road at the point of the track nearest `at`
+    fn gate(&mut self, at: [f64; 2], kind: Gate) {
+        let i = self.line.nearest(at);
+        let (p, t) = (self.line.points[i], self.line.tangent(i));
+        let normal = [-t[1], t[0]];
+        // paints a block of art pixels centred `along` the road and `across` it
+        let block = |c: &mut City, along: f64, across: f64, half_along: i32, half_across: i32, f: &dyn Fn(i32, i32) -> u32| {
+            for a in -half_along..=half_along {
+                for b in -half_across..=half_across {
+                    let x = p[0] + t[0] * (along + a as f64 * 2.5) + normal[0] * (across + b as f64 * 2.5);
+                    let y = p[1] + t[1] * (along + a as f64 * 2.5) + normal[1] * (across + b as f64 * 2.5);
+                    c.set(x as i32 / S, (H - y as i32) / S, f(a, b));
+                }
+            }
+        };
+        let legs = (ROAD + WALK + 8) as f64;
+        let reach = (legs / 2.5) as i32;
+        match kind {
+            Gate::Torii => {
+                for side in [-1.0, 1.0] {
+                    block(self, 0.0, side * legs, 2, 2, &|a, b| if a.abs() == 2 || b.abs() == 2 { OUTLINE } else { rgb(0xd8342c) });
+                }
+                block(self, 0.0, 0.0, 2, reach + 5, &|a, b| if a == -2 || b.abs() == reach + 5 { OUTLINE } else if a == -1 { BLACK } else { rgb(0xd8342c) });
+                block(self, 8.0, 0.0, 1, reach + 1, &|a, _| if a == 1 { OUTLINE } else { rgb(0xb22a24) });
+            }
+            Gate::Brooklyn => {
+                for side in [-1.0, 1.0] {
+                    block(self, 0.0, side * (legs + 2.0), 4, 4, &|a, b| if a.abs() == 4 || b.abs() == 4 { OUTLINE } else if a.abs() <= 1 && b.abs() <= 1 { rgb(0x4a4136) } else { rgb(0xd6c6a3) });
+                }
+                block(self, 0.0, 0.0, 3, reach + 1, &|a, b| if a.abs() == 3 { OUTLINE } else if (b.abs() as f64) < reach as f64 - 4.0 && a.abs() <= 1 { rgb(0x4a4136) } else { rgb(0xc9b48c) });
+            }
+            Gate::TowerBridge => {
+                for along in [-40.0, 40.0] {
+                    for side in [-1.0, 1.0] {
+                        block(self, along, side * (legs + 4.0), 5, 5, &|a, b| if a.abs() == 5 || b.abs() == 5 { OUTLINE } else if a < -2 { rgb(0x4f7fbf) } else { rgb(0xd6c6a3) });
+                    }
+                }
+                // the high walkways, pale blue, either side
+                for side in [-1.0, 1.0] {
+                    block(self, 0.0, side * (legs + 4.0), 16, 1, &|_, b| if b == 0 { rgb(0x7fb2e0) } else { OUTLINE });
+                }
+            }
+            Gate::Rainbow => {
+                for side in [-1.0, 1.0] {
+                    block(self, 0.0, side * legs, 3, 3, &|a, b| if a.abs() == 3 || b.abs() == 3 { rgb(0x9aa0a8) } else { WHITE });
+                }
+                block(self, 0.0, 0.0, 1, reach + 3, &|a, _| if a == 1 { rgb(0x9aa0a8) } else { WHITE });
+            }
+            Gate::ElevatedRail => {
+                for side in [-1.0, 1.0] {
+                    for along in [-14.0, 14.0] {
+                        block(self, along, side * legs, 1, 1, &|_, _| rgb(0x3a3c42));
+                    }
+                }
+                block(self, 0.0, 0.0, 6, reach + 6, &|a, b| if a.abs() == 6 { OUTLINE } else if a.abs() == 3 { rgb(0x8d8f96) } else if b % 3 == 0 { rgb(0x5a3a22) } else { rgb(0x6f4a2a) });
+            }
+            Gate::Alexandre => {
+                for along in [-50.0, 50.0] {
+                    for side in [-1.0, 1.0] {
+                        block(self, along, side * legs, 3, 3, &|a, b| if a.abs() == 3 || b.abs() == 3 { OUTLINE } else if a.abs() <= 1 && b.abs() <= 1 { rgb(0xf2c84b) } else { rgb(0xd8ceb6) });
+                    }
+                }
             }
         }
     }
@@ -853,68 +1064,92 @@ impl City {
         self.set(ax, ay, rgb(0xa52f2a));
     }
 
-    /// zebra crossings across the road just before every corner
+    /// zebra crossings across the road near both ends of every long straight
     fn crosswalks(&mut self) {
-        for i in 0..self.path.len() - 1 {
-            let (a, b) = (self.path[i], self.path[i + 1]);
-            let vertical = a[0] == b[0];
-            let len = (b[0] - a[0]).abs() + (b[1] - a[1]).abs();
-            if len < 3 * ROAD + 60 {
+        let n = self.line.len();
+        for (a, len) in self.straights() {
+            if len < 50 {
                 continue;
             }
-            for end in 0..2 {
-                let t = if end == 0 { ROAD + 6 } else { len - ROAD - 30 };
-                let mut k = 0;
-                while k < 24 {
-                    let mut across = -ROAD + 12;
-                    while across <= ROAD - 12 {
-                        if ((across + ROAD) / 9) % 2 != 0 {
-                            across += S;
-                            continue;
-                        }
-                        let x = if vertical { a[0] + across } else { a[0] + (b[0] - a[0]).signum() * (t + k) };
-                        let y = if vertical { a[1] + (b[1] - a[1]).signum() * (t + k) } else { a[1] + across };
-                        if !self.is_water(x, y) && !((x - 200).abs() < ROAD && y > 250 && y < 340) {
-                            self.set(x / S, (H - y) / S, WHITE);
-                        }
-                        across += S;
+            for k0 in [8, len - 12] {
+                for k in k0..k0 + 4 {
+                    let i = (a + k) % n;
+                    let p = self.line.points[i];
+                    if self.line.near_start(p[0], p[1]) {
+                        continue;
                     }
-                    k += S;
+                    let mut across = -ROAD + 10;
+                    while across <= ROAD - 10 {
+                        if ((across + ROAD) / 8) % 2 == 0 {
+                            let (x, y) = self.beside(i, across as f64);
+                            if !self.is_water(x, y) {
+                                self.set(x / S, (H - y) / S, WHITE);
+                            }
+                        }
+                        across += 2;
+                    }
                 }
             }
         }
     }
 
-    /// the Shibuya scramble: stripes across all four sides and both diagonals
-    fn scramble(&mut self, cx: i32, cy: i32) {
-        let mut y = cy - ROAD + 6;
-        while y <= cy + ROAD - 6 {
-            let mut x = cx - 70;
-            while x <= cx + 70 {
-                let (dx, dy) = (x - cx, y - cy);
-                let diagonal = (dx.abs() - dy.abs() * 70 / (ROAD - 6)).abs() < 9;
-                let side = dx.abs() > 52;
-                if (diagonal || side) && ((if side { y } else { x + y }) / 7) % 2 == 0 {
-                    self.set(x / S, (H - y) / S, WHITE);
+    /// the Shibuya scramble at the point of the track nearest `at`: zebra stripes across the
+    /// road at both ends and along both diagonals, and big screens looking down on it
+    fn scramble(&mut self, at: [f64; 2]) {
+        let i = self.line.nearest(at);
+        let (p, t) = (self.line.points[i], self.line.tangent(i));
+        let normal = [-t[1], t[0]];
+        let half = (ROAD - 6) as f64;
+        let mut a = -half;
+        while a <= half {
+            let mut b = -half;
+            while b <= half {
+                let diagonal = (a.abs() - b.abs()).abs() < 7.0;
+                let end = a.abs() > half - 16.0;
+                let stripe = if end { (b / 7.0).floor() as i64 % 2 == 0 } else { ((a + b) / 7.0).floor() as i64 % 2 == 0 };
+                if (diagonal || end) && stripe {
+                    let (x, y) = (p[0] + t[0] * a + normal[0] * b, p[1] + t[1] * a + normal[1] * b);
+                    self.set(x as i32 / S, (H - y as i32) / S, WHITE);
                 }
-                x += S;
+                b += 2.0;
             }
-            y += S;
+            a += 2.0;
         }
-        // the big screens looking down on the crossing
-        for sc in [[870, 690], [1060, 700], [940, 560]] {
-            let (ax, ay) = (sc[0] / S, (H - sc[1]) / S);
-            for y in 0..6 {
-                for x in 0..10 {
-                    let c = NEON[((x / 3 + y / 2) % NEON.len() as i32) as usize];
-                    self.set(ax + x, ay + y, if x == 0 || y == 0 || x == 9 || y == 5 { OUTLINE } else { c });
+        // the big screens on the corners
+        for (al, ac) in [(-90.0, 1.0), (90.0, -1.0), (90.0, 1.0)] {
+            let (x, y) = (p[0] + t[0] * al + normal[0] * ac * (ROAD + WALK + 30) as f64, p[1] + t[1] * al + normal[1] * ac * (ROAD + WALK + 30) as f64);
+            let (ax, ay) = (x as i32 / S, (H - y as i32) / S);
+            for yy in 0..6 {
+                for xx in 0..10 {
+                    let c = NEON[((xx / 3 + yy / 2) % NEON.len() as i32) as usize];
+                    self.set(ax + xx - 5, ay + yy - 3, if xx == 0 || yy == 0 || xx == 9 || yy == 5 { OUTLINE } else { c });
                 }
             }
         }
     }
 
-    /// where the road crosses water: a deck with railings (and towers for New York's bridges)
-    fn bridges(&mut self, rail: u32, rail_dark: u32, suspension: bool) {
+    /// where the road crosses water: a deck with railings (a special bridge in its own colours)
+    fn bridges(&mut self, rail: u32, rail_dark: u32) {
+        // the railing colours along the lap: the usual ones, or a special bridge's over its span
+        let n = self.line.len();
+        let mut colours = vec![(rail, rail_dark); n];
+        let over_water = |c: &City, i: usize| {
+            let p = c.line.points[i];
+            c.is_water(p[0] as i32, p[1] as i32)
+        };
+        for &(at, r, dark) in &self.special_bridges.clone() {
+            let i = self.line.nearest(at);
+            for dir in [1, n - 1] {
+                let mut k = i;
+                while over_water(self, k) || k == i {
+                    colours[k] = (r, dark);
+                    k = (k + dir) % n;
+                    if k == i {
+                        break;
+                    }
+                }
+            }
+        }
         for ay in 0..AH {
             for ax in 0..AW {
                 let (x, y) = (ax * S + 1, H - ay * S - 1);
@@ -922,6 +1157,7 @@ impl City {
                     continue;
                 }
                 let d = self.road_distance(x, y);
+                let (rail, rail_dark) = colours[self.field.nearest(x, y).0];
                 if d > ROAD && d <= ROAD + WALK - S {
                     self.set(ax, ay, rgb(0x9b958c));
                 } else if d > ROAD + WALK - S && d <= ROAD + WALK + S {
@@ -931,68 +1167,17 @@ impl City {
                 }
             }
         }
-        if !suspension {
-            return;
-        }
-        // stone towers with arches where each bridge meets the river's middle
-        for i in 0..self.path.len() - 1 {
-            let (a, b) = (self.path[i], self.path[i + 1]);
-            if a[1] != b[1] {
-                continue;
-            }
-            let mut x = a[0].min(b[0]);
-            while x <= a[0].max(b[0]) {
-                let probe = a[1] + ROAD + WALK + 20;
-                if self.is_water(x, probe) && self.is_water(x - 60, probe) && !self.is_water(x - 120, probe) {
-                    self.stone_tower(x / S, (H - a[1]) / S);
-                    break;
-                }
-                x += S;
-            }
-        }
     }
 
-    fn stone_tower(&mut self, ax: i32, cy: i32) {
-        let top = cy - (ROAD + WALK) / S - 10;
-        let bottom = cy + (ROAD + WALK) / S + 4;
-        for y in top..=bottom {
-            for x in ax - 4..=ax + 4 {
-                let arch = (x - ax).abs() <= 1 && (y > top + 3 && y < cy - 4 || y > cy + 4 && y < bottom - 2);
-                let c = if (x - ax).abs() == 4 || y == top || y == bottom {
-                    OUTLINE
-                } else if arch {
-                    rgb(0x4a4136)
-                } else if x < ax {
-                    rgb(0xd6c6a3)
-                } else {
-                    rgb(0xb9a481)
-                };
-                if (y - cy).abs() > (ROAD - 4) / S || (x - ax).abs() == 4 {
-                    self.set(x, y, c);
-                }
-            }
-        }
-        // cables fanning out from the tower tops
-        let mut k = 4;
-        while k < 30 {
-            self.set(ax - k, top + 1 + k / 6, rgb(0x3d3a34));
-            self.set(ax + k, top + 1 + k / 6, rgb(0x3d3a34));
-            self.set(ax - k, bottom - 1 - k / 6, rgb(0x3d3a34));
-            self.set(ax + k, bottom - 1 - k / 6, rgb(0x3d3a34));
-            k += 2;
-        }
-    }
 
+    /// the checkered start/finish line across the road
     fn start_line(&mut self) {
-        let mut y = 300;
-        while y < 324 {
-            let mut x = 200 - ROAD + S;
-            while x < 200 + ROAD - S {
-                let (cx, cy) = ((x - (200 - ROAD)) / 6, (y - 300) / 6);
-                self.set(x / S, (H - 1 - y) / S, if (cx + cy) % 2 == 0 { WHITE } else { rgb(0x1b1b1f) });
-                x += S;
+        for ay in 0..AH {
+            for ax in 0..AW {
+                if let Some(square) = self.line.start_line((ax * S + 1) as f64, (H - ay * S - 1) as f64) {
+                    self.set(ax, ay, if square == 0 { WHITE } else { rgb(0x1b1b1f) });
+                }
             }
-            y += S;
         }
     }
 
@@ -1265,61 +1450,6 @@ impl City {
         self.forest(x0, y0, x1, y1, 0.0, 900);
     }
 
-    /// Times Square: billboards everywhere, the red TKTS steps, a crowd
-    fn times_square(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
-        let (ax0, ax1, ay0, ay1) = (x0 / S, x1 / S, (H - y1) / S, (H - y0) / S);
-        for ay in ay0..=ay1 {
-            for ax in ax0..=ax1 {
-                if self.free_art(ax, ay) {
-                    self.set(ax, ay, if (ax + ay) % 7 == 0 { rgb(0xa79f92) } else { rgb(0xc4bcae) });
-                }
-            }
-        }
-        // buildings around the square, every one covered in screens
-        let mut ay = ay0 + 2;
-        while ay < ay1 - 20 {
-            for side in 0..2 {
-                let ax = if side == 0 { ax0 + 4 } else { ax1 - 25 };
-                if !self.fits(ax, ay, 20, 24) {
-                    continue;
-                }
-                self.tower(ax, ay, 20, 24, rgb(0x8f98a6), false, false);
-                for b in 0..3 {
-                    let c = self.pick(&NEON);
-                    let by = ay + 6 + b * 6;
-                    for y in 0..5 {
-                        for x in 2..18 {
-                            let col = if y == 0 || y == 4 { OUTLINE } else if (x + y) % 5 == 0 { WHITE } else { c };
-                            self.set(ax + x, by + y, col);
-                        }
-                    }
-                }
-            }
-            ay += 28;
-        }
-        // the red steps in the middle and the crowd
-        let (sx, sy) = ((ax0 + ax1) / 2, (ay0 + ay1) / 2);
-        for y in 0..12 {
-            for x in -7..=7 {
-                self.set(sx + x, sy + y, if y % 2 == 0 { rgb(0xd8342c) } else { rgb(0xa8241f) });
-            }
-        }
-        self.outline(sx - 7, sy, 15, 12);
-        for _ in 0..140 {
-            let px = ax0 + 4 + self.rnd.next_int((ax1 - ax0 - 8).max(1));
-            let py = ay0 + self.rnd.next_int((ay1 - ay0).max(1));
-            if self.free_art(px, py) && !self.is_tree_or_building(px, py) && self.get(px, py) != OUTLINE {
-                let c = self.pick(&NEON);
-                self.set(px, py, c);
-                self.set(px, py + 1, rgb(0x3a3a48));
-            }
-        }
-        // a hot dog cart
-        self.set(sx + 11, sy + 4, rgb(0xd9d9d9));
-        self.set(sx + 12, sy + 4, rgb(0xf2c84b));
-        self.set(sx + 11, sy + 3, rgb(0xd9433b));
-        self.set(sx + 12, sy + 3, rgb(0x3b6fd9));
-    }
 
     /// the Empire State Building: stepped tower and spire rising up the picture
     fn empire_state(&mut self, x: i32, y: i32) {
@@ -1479,7 +1609,7 @@ impl City {
     /// Millennium Park: lawns, the Bean (Cloud Gate) and Buckingham Fountain
     fn millennium_park(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
         self.forest(x0, y0, x1, y1, 0.0, 1800);
-        let (bx, by) = (1300 / S, (H - 440) / S);
+        let (bx, by) = ((x0 + x1) / 2 / S, (H - (y1 - 80)) / S); // the Bean
         for ay in by - 9..=by + 9 {
             for ax in bx - 14..=bx + 14 {
                 self.set(ax, ay, if (ax + ay) % 6 == 0 { rgb(0xc9c1b1) } else { rgb(0xdcd4c4) }); // the plaza
@@ -1506,7 +1636,7 @@ impl City {
             }
         }
         // Buckingham Fountain: pink stone basins in a pool
-        let (fx, fy) = (1300 / S, (H - 300) / S);
+        let (fx, fy) = ((x0 + x1) / 2 / S, (H - (y0 + 50)) / S); // the Crown Fountain
         let wc = self.water_color;
         self.disc(fx, fy, 9, rgb(0xd9c3b5));
         self.disc(fx, fy, 8, wc);
@@ -1729,46 +1859,6 @@ impl City {
         }
     }
 
-    /// Tower Bridge on the vertical crossing: two stone towers with blue walkways between
-    fn tower_bridge(&mut self, x: i32, _y: i32) {
-        let ax = x / S;
-        let (bank_low, bank_high) = ((H - 640) / S, (H - 745) / S);
-        let reach = (ROAD + WALK) / S;
-        for ty in [bank_low - 4, bank_high + 4] {
-            for dy in -7i32..=7 {
-                for dx in -reach - 4..=reach + 4 {
-                    let over_road = dx.abs() < (ROAD - 6) / S && dy.abs() < 4;
-                    if over_road {
-                        continue; // the archway the road runs through
-                    }
-                    let edge = dy.abs() == 7 || dx.abs() == reach + 4;
-                    let c = if edge {
-                        OUTLINE
-                    } else if dy < -4 {
-                        rgb(0x4f7fbf)
-                    } else if dx < 0 {
-                        rgb(0xd6c6a3)
-                    } else {
-                        rgb(0xb9a481)
-                    };
-                    self.set(ax + dx, ty + dy, c);
-                }
-            }
-            // the turrets at the corners
-            for side in [-1, 1] {
-                let tx = ax + side * (reach + 3);
-                self.set(tx, ty - 8, rgb(0x3f6fae));
-                self.set(tx, ty - 9, OUTLINE);
-            }
-        }
-        // the high walkways, pale blue, on both sides
-        for ay in bank_high + 4..=bank_low - 4 {
-            for side in [-1, 1] {
-                self.set(ax + side * (reach + 2), ay, rgb(0x7fb2e0));
-                self.set(ax + side * (reach + 3), ay, OUTLINE);
-            }
-        }
-    }
 
     /// red telephone boxes along the fence lines
     fn phone_boxes(&mut self) {
@@ -2194,51 +2284,6 @@ impl City {
         self.set(ax, base + 3, rgb(0xd9d9d9));
     }
 
-    /// Shilin Night Market: rows of stalls with colored awnings, red lanterns and a crowd
-    fn night_market(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
-        let (ax0, ax1, ay0, ay1) = (x0 / S, x1 / S, (H - y1) / S, (H - y0) / S);
-        for ay in ay0..=ay1 {
-            for ax in ax0..=ax1 {
-                if self.open_art(ax, ay) {
-                    self.set(ax, ay, if (ax + ay) % 6 == 0 { rgb(0x9a958c) } else { rgb(0xb3ada2) });
-                }
-            }
-        }
-        let mut ay = ay0 + 2;
-        while ay < ay1 - 6 {
-            let mut ax = ax0 + 2;
-            while ax < ax1 - 8 {
-                let c = self.pick(&AWNINGS);
-                for dy in 0i32..6 {
-                    for dx in 0i32..7 {
-                        let col = if dy < 3 {
-                            if dx % 2 == 0 { c } else { WHITE }
-                        } else if dy == 3 {
-                            blend(c, OUTLINE, 0.4)
-                        } else if dx % 2 == 0 {
-                            rgb(0xf2c84b) // food on the counter
-                        } else {
-                            rgb(0xd9a14a)
-                        };
-                        self.set(ax + dx, ay + dy, col);
-                    }
-                }
-                self.outline(ax, ay, 7, 6);
-                self.set(ax + 3, ay - 2, rgb(0xff5a4a)); // a lantern
-                ax += 9;
-            }
-            ay += 11;
-        }
-        for _ in 0..120 {
-            let px = ax0 + self.rnd.next_int((ax1 - ax0).max(1));
-            let py = ay0 + self.rnd.next_int((ay1 - ay0).max(1));
-            if self.get(px, py) == rgb(0xb3ada2) && self.get(px, py - 1) == rgb(0xb3ada2) {
-                self.set(px, py - 1, rgb(0xf0c8a0));
-                let c = self.pick(&NEON);
-                self.set(px, py, c);
-            }
-        }
-    }
 
     /// green mountains behind the city
     fn hills(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
@@ -2284,285 +2329,875 @@ impl City {
     }
 }
 
+impl City {
+    // ================================================================== more landmarks
+
+    /// a tower rising up the picture from its base at (x, y): tiers of (half width, height,
+    /// colour) from the ground up, then a spire
+    fn tiers(&mut self, x: i32, y: i32, tiers: &[(i32, i32, u32)], spire: i32, spire_colour: u32) {
+        let (ax, base) = (x / S, (H - y) / S);
+        let mut top = base;
+        for &(half, h, c) in tiers {
+            for dy in 0..h {
+                for dx in -half..=half {
+                    let edge = dx.abs() == half || dy == h - 1;
+                    let col = if edge {
+                        OUTLINE
+                    } else if dx == -half + 1 {
+                        blend(c, WHITE, 0.3)
+                    } else if dy % 3 == 0 {
+                        blend(c, OUTLINE, 0.2)
+                    } else if self.rnd.next_int(14) == 0 {
+                        LIT
+                    } else {
+                        c
+                    };
+                    self.set(ax + dx, top - dy, col);
+                }
+            }
+            top -= h;
+        }
+        for dy in 0..spire {
+            self.set(ax, top - dy, spire_colour);
+        }
+        let widest = tiers.iter().map(|t| t.0).max().unwrap_or(4);
+        for dx in -widest..=widest {
+            self.shade(ax + dx + 3, base + 1, 0.6);
+        }
+    }
+
+    /// a tapering tower (the Shard, the Skytree's base): half width w0 at the bottom to w1 at the top
+    fn taper(&mut self, x: i32, y: i32, w0: i32, w1: i32, h: i32, c: u32, glass: bool) {
+        let (ax, base) = (x / S, (H - y) / S);
+        for dy in 0..h {
+            let half = w0 + (w1 - w0) * dy / h.max(1);
+            for dx in -half..=half {
+                let edge = dx.abs() == half;
+                let col = if edge {
+                    OUTLINE
+                } else if dx < 0 {
+                    blend(c, WHITE, 0.25)
+                } else if glass && (dx + dy) % 4 == 0 {
+                    blend(c, GLASS, 0.5)
+                } else {
+                    c
+                };
+                self.set(ax + dx, base - dy, col);
+            }
+        }
+        for dx in -w0..=w0 {
+            self.shade(ax + dx + 3, base + 1, 0.6);
+        }
+    }
+
+
+
+    /// Tokyo Skytree: a slim white lattice tower, the tallest thing in Tokyo
+    fn skytree(&mut self, x: i32, y: i32) {
+        self.taper(x, y, 9, 3, 96, rgb(0xe8eef4), false);
+        let (ax, base) = (x / S, (H - y) / S);
+        for (dy, w) in [(56, 6), (72, 5)] {
+            for dx in -w..=w {
+                self.set(ax + dx, base - dy, OUTLINE);
+                self.set(ax + dx, base - dy - 1, GLASS);
+                self.set(ax + dx, base - dy - 2, OUTLINE);
+            }
+        }
+        for dy in 96..112 {
+            self.set(ax, base - dy, if dy % 3 == 0 { rgb(0x9aa0a8) } else { WHITE });
+        }
+    }
+
+    /// Senso-ji: the Kaminarimon gate with its giant red lantern, the path of stalls, the main
+    /// hall and the five-storey pagoda
+    fn sensoji(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        // the Nakamise path of little stalls up to the hall
+        for py in ay - 30..=ay + 4 {
+            for px in ax - 2..=ax + 2 {
+                self.set(px, py, rgb(0xd9d0bd));
+            }
+            if py % 4 == 0 {
+                self.set(ax - 4, py, AWNINGS[(py.unsigned_abs() as usize) % 4]);
+                self.set(ax + 4, py, AWNINGS[(py.unsigned_abs() as usize + 2) % 4]);
+            }
+        }
+        // the Kaminarimon: a red gate, black roof, and the big red lantern hanging in it
+        for py in ay..ay + 6 {
+            for px in ax - 7..=ax + 7 {
+                let c = if py == ay { rgb(0x2a2a30) } else if (px - ax).abs() <= 1 { rgb(0xd8342c) } else if (px - ax).abs() >= 6 { rgb(0xb22a24) } else { rgb(0xd8342c) };
+                self.set(px, py, c);
+            }
+        }
+        self.disc(ax, ay + 3, 2, rgb(0xff5a4a));
+        self.set(ax, ay + 3, rgb(0x2a2a30));
+        // the main hall
+        let (hx, hy) = (ax - 10, ay - 44);
+        for ry in 0..14 {
+            for rx in 0..21 {
+                let c = if ry < 7 { if ry % 2 == 0 { rgb(0x3f4f48) } else { rgb(0x52645b) } } else if rx % 4 == 1 { rgb(0xc8322a) } else { rgb(0xf1e7d0) };
+                self.set(hx + rx, hy + ry, c);
+            }
+        }
+        self.outline(hx, hy, 21, 14);
+        // the five-storey pagoda beside it
+        let (px0, pbase) = (ax + 16, ay - 20);
+        for storey in 0..5 {
+            let w = 6 - storey;
+            let y0 = pbase - storey * 5;
+            for dx in -w - 1..=w + 1 {
+                self.set(px0 + dx, y0 - 3, rgb(0x2a2a30));
+            }
+            for dy in 0..3 {
+                for dx in -w..=w {
+                    self.set(px0 + dx, y0 - dy, if dx.abs() == w { OUTLINE } else { rgb(0xd8342c) });
+                }
+            }
+        }
+        for dy in 0..6 {
+            self.set(px0, pbase - 25 - dy, rgb(0xf2c84b));
+        }
+    }
+
+    /// the Imperial Palace: a square moat, stone walls, green grounds, the white palace and
+    /// Nijubashi bridge over the moat
+    fn imperial_palace(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        let (rw, rh) = (52, 40);
+        for py in ay - rh..=ay + rh {
+            for px in ax - rw..=ax + rw {
+                let (dx, dy) = ((px - ax).abs(), (py - ay).abs());
+                let c = if dx > rw - 5 || dy > rh - 5 {
+                    if (px + py) % 9 == 0 { self.water_dark } else { self.water_color } // the moat
+                } else if dx > rw - 7 || dy > rh - 7 {
+                    rgb(0xb9b2a4) // the stone walls
+                } else if (px * 3 + py * 5) % 11 == 0 {
+                    GRASS_LIGHT
+                } else {
+                    GRASS
+                };
+                self.set(px, py, c);
+            }
+        }
+        // the palace buildings: long white halls with dark green roofs
+        for (hx, hy, w) in [(ax - 22, ay - 12, 26), (ax + 6, ay - 4, 16), (ax - 10, ay + 10, 22)] {
+            for ry in 0..8 {
+                for rx in 0..w {
+                    self.set(hx + rx, hy + ry, if ry < 4 { if ry % 2 == 0 { rgb(0x3f6f5a) } else { rgb(0x4f8068) } } else { rgb(0xf3eee2) });
+                }
+            }
+            self.outline(hx, hy, w, 8);
+        }
+        // Nijubashi: the stone bridge over the moat at the front
+        for py in ay + rh - 6..=ay + rh {
+            for px in ax - 3..=ax + 3 {
+                self.set(px, py, if (px - ax).abs() == 3 { OUTLINE } else { rgb(0xd6c6a3) });
+            }
+        }
+        for t in 0..=3 {
+            self.tree(ax - 38 + t * 9, ay + 26, false);
+            self.tree(ax + 14 + t * 9, ay - 28, false);
+        }
+    }
+
+    /// Tokyo Big Sight: four upside-down pyramids standing on legs above the plaza
+    fn big_sight(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        for py in ay - 2..=ay + 14 {
+            for px in ax - 34..=ax + 34 {
+                self.set(px, py, if (px + py) % 6 == 0 { PAVE_LINE } else { PAVE });
+            }
+        }
+        for (k, ox) in [-24, -8, 8, 24].into_iter().enumerate() {
+            let oy = if k % 2 == 0 { 0 } else { 3 };
+            for dy in 0i32..12 {
+                let half = 2 + dy * 6 / 11;
+                for dx in -half..=half {
+                    let edge = dx.abs() == half || dy == 11;
+                    self.set(ax + ox + dx, ay + oy - dy, if edge { OUTLINE } else if dx < 0 { rgb(0xc9d1d8) } else { rgb(0x9fb0bf) });
+                }
+            }
+            for dy in 0..3 {
+                self.set(ax + ox, ay + oy + dy + 1, rgb(0x6f7a85)); // the leg
+            }
+        }
+    }
+
+    /// the life-size Gundam on Odaiba: white, blue and red, standing on its plinth
+    fn gundam(&mut self, x: i32, y: i32) {
+        let (ax, base) = (x / S, (H - y) / S);
+        let rows: [(&str, i32); 14] = [
+            ("..YY..", 0), (".WWWW.", 0), ("..WW..", 0), ("BBRRBB", 0), ("WBBBBW", 0), ("WBBBBW", 0),
+            ("W.RR.W", 0), ("..WW..", 0), (".WWWW.", 0), (".BB.BB", 0), (".WW.WW", 0), (".WW.WW", 0),
+            (".RR.RR", 0), ("GGGGGGG", 0),
+        ];
+        for (k, (row, _)) in rows.iter().enumerate() {
+            for (dx, ch) in row.chars().enumerate() {
+                let c = match ch {
+                    'Y' => rgb(0xf2c84b),
+                    'W' => rgb(0xf3f1ea),
+                    'B' => rgb(0x2f5fb8),
+                    'R' => rgb(0xd8342c),
+                    'G' => rgb(0x8d8f96),
+                    _ => continue,
+                };
+                self.set(ax - 3 + dx as i32, base - 13 + k as i32, c);
+            }
+        }
+        for dx in -4i32..=4 {
+            self.shade(ax + dx + 2, base + 1, 0.6);
+        }
+    }
+
+    /// Rockefeller Center: the skating rink, the golden statue and the Christmas tree
+    fn rockefeller(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        for py in ay - 6..=ay + 6 {
+            for px in ax - 10..=ax + 10 {
+                let edge = (px - ax).abs() == 10 || (py - ay).abs() == 6;
+                self.set(px, py, if edge { OUTLINE } else if (px + py) % 5 == 0 { WHITE } else { rgb(0xcfe8f4) });
+            }
+        }
+        self.set(ax, ay - 4, rgb(0xf2c84b));
+        self.set(ax + 1, ay - 4, rgb(0xd9a822));
+        // the tree, decorated
+        for dy in 0i32..12 {
+            let half = (12 - dy) / 2;
+            for dx in -half..=half {
+                let c = if (dx + dy) % 4 == 0 { NEON[((dx + dy).unsigned_abs() as usize) % NEON.len()] } else { TREE_DARK };
+                self.set(ax + dx, ay - 8 - dy, c);
+            }
+        }
+        self.set(ax, ay - 20, rgb(0xffe58a));
+    }
+
+    /// Buckingham Fountain: a tiered pink-granite fountain in a round pool
+    fn fountain(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        self.disc(ax, ay, 14, rgb(0xd6c6a3));
+        self.disc(ax, ay, 12, self.water_color);
+        for r in [7, 4] {
+            self.disc(ax, ay, r, rgb(0xe8b8a8));
+            self.disc(ax, ay, r - 1, rgb(0x8fd0f0));
+        }
+        self.disc(ax, ay, 1, WHITE);
+        for k in 0..8 {
+            let a = k as f64 * PI / 4.0;
+            self.set(ax + (10.0 * a.cos()) as i32, ay + (10.0 * a.sin()) as i32, WHITE);
+        }
+    }
+
+    /// a ballpark: the stands round a green diamond (Wrigley's ivy and red sign if `ivy`)
+    fn ballpark(&mut self, x: i32, y: i32, ivy: bool) {
+        let (cx, cy) = (x / S, (H - y) / S);
+        let r = 34;
+        for ay in cy - r..=cy + r {
+            for ax in cx - r..=cx + r {
+                let (dx, dy) = ((ax - cx) as f64, (ay - cy) as f64);
+                let d = (dx * dx + dy * dy).sqrt();
+                if d > r as f64 {
+                    continue;
+                }
+                let a = (-dy).atan2(dx);
+                let c = if d > r as f64 - 6.0 {
+                    if ivy && d < r as f64 - 4.0 { rgb(0x2f7a32) } else if (ax + ay) % 3 == 0 { rgb(0x3b6fd9) } else { rgb(0x6f727c) }
+                } else if (a - 0.8).abs() < 0.5 && d < 15.0 {
+                    rgb(0xc8956a)
+                } else if ((ax / 3) + (ay / 3)) % 2 == 0 {
+                    rgb(0x5aa84a)
+                } else {
+                    rgb(0x67b552)
+                };
+                self.set(ax, ay, c);
+            }
+        }
+        if ivy {
+            // the red marquee sign at the entrance
+            for ax in cx - 6..=cx + 6 {
+                self.set(ax, cy + r + 1, rgb(0xd8342c));
+                self.set(ax, cy + r + 2, if ax % 2 == 0 { WHITE } else { rgb(0xd8342c) });
+            }
+        }
+    }
+
+    /// Marina City: two round "corncob" towers of balconies on the river
+    fn marina_city(&mut self, x: i32, y: i32) {
+        for dx in [-24, 24] {
+            let (ax, base) = ((x + dx) / S, (H - y) / S);
+            for dy in 0..40 {
+                for k in -6i32..=6 {
+                    let edge = k.abs() == 6;
+                    let c = if edge { OUTLINE } else if dy % 2 == 0 { rgb(0xe8e4dc) } else if k.abs() < 3 { rgb(0xc9c4ba) } else { rgb(0x8f8a80) };
+                    self.set(ax + k, base - dy, c);
+                }
+            }
+            self.disc(ax, base - 40, 6, rgb(0xd9d4ca));
+            self.outline(ax - 6, base - 46, 13, 2);
+        }
+    }
+
+    /// Soldier Field: an oval stadium with columns, its green pitch inside
+    fn stadium(&mut self, x: i32, y: i32) {
+        let (cx, cy) = (x / S, (H - y) / S);
+        for ay in cy - 22..=cy + 22 {
+            for ax in cx - 34..=cx + 34 {
+                let d = ((ax - cx) as f64 / 34.0).powi(2) + ((ay - cy) as f64 / 22.0).powi(2);
+                if d > 1.0 {
+                    continue;
+                }
+                let c = if d > 0.72 { if (ax + ay) % 4 == 0 { rgb(0xd9d4ca) } else { rgb(0x9aa0a8) } } else if (ax - cx) % 6 == 0 { WHITE } else { rgb(0x5aa84a) };
+                self.set(ax, ay, c);
+            }
+        }
+    }
+
+    /// the Tower of London: the White Tower inside its curtain walls and towers
+    fn tower_of_london(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        for py in ay - 22..=ay + 22 {
+            for px in ax - 26..=ax + 26 {
+                let (dx, dy) = ((px - ax).abs(), (py - ay).abs());
+                let c = if dx > 23 || dy > 19 { rgb(0xb9a481) } else if (px + py) % 7 == 0 { GRASS_LIGHT } else { GRASS };
+                self.set(px, py, c);
+            }
+        }
+        for (tx, ty) in [(ax - 25, ay - 21), (ax + 25, ay - 21), (ax - 25, ay + 21), (ax + 25, ay + 21)] {
+            self.disc(tx, ty, 3, rgb(0xa89470));
+        }
+        // the White Tower, with its four turrets
+        let (hx, hy) = (ax - 9, ay - 12);
+        for ry in 0..20 {
+            for rx in 0..18 {
+                let c = if ry < 6 { rgb(0x8f8a80) } else if rx % 4 == 1 && ry % 5 == 2 { rgb(0x2a2a30) } else { rgb(0xeee8da) };
+                self.set(hx + rx, hy + ry, c);
+            }
+        }
+        self.outline(hx, hy, 18, 20);
+        for (tx, ty) in [(hx, hy), (hx + 17, hy), (hx, hy + 6), (hx + 17, hy + 6)] {
+            self.disc(tx, ty, 2, rgb(0x6f8f9a));
+        }
+    }
+
+    /// Nelson's Column in Trafalgar Square, with its lions and fountains
+    fn nelson(&mut self, x: i32, y: i32) {
+        let (ax, base) = (x / S, (H - y) / S);
+        for py in base - 4..=base + 14 {
+            for px in ax - 22..=ax + 22 {
+                self.set(px, py, if (px + py) % 6 == 0 { PAVE_LINE } else { PAVE });
+            }
+        }
+        for fx in [ax - 14, ax + 14] {
+            self.disc(fx, base + 8, 4, rgb(0xd6c6a3));
+            self.disc(fx, base + 8, 3, rgb(0x8fd0f0));
+        }
+        for (lx, ly) in [(ax - 4, base + 1), (ax + 4, base + 1), (ax - 4, base - 3), (ax + 4, base - 3)] {
+            self.set(lx, ly, rgb(0x3a3c42)); // the lions
+        }
+        for dy in 0..44 {
+            self.set(ax, base - dy, if dy < 4 { rgb(0xb9b2a4) } else { rgb(0xd6c6a3) });
+            self.set(ax + 1, base - dy, if dy < 4 { rgb(0xa89c82) } else { rgb(0xb9a481) });
+        }
+        self.set(ax, base - 45, rgb(0x5a5c63));
+        self.set(ax, base - 46, rgb(0x5a5c63));
+    }
+
+    /// Les Invalides: the gold dome over the long front courtyard
+    fn invalides(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        for py in ay..=ay + 24 {
+            for px in ax - 26..=ax + 26 {
+                let ring = (px - ax).abs() > 20 || py > ay + 18;
+                self.set(px, py, if ring { rgb(0xe3dccf) } else if (px + py) % 7 == 0 { GRASS_LIGHT } else { GRASS });
+            }
+        }
+        self.outline(ax - 26, ay, 53, 25);
+        for dy in 0..18 {
+            let half = ((18 - dy) as f64 * 0.6) as i32 + 3;
+            for dx in -half..=half {
+                let c = if dx.abs() == half { OUTLINE } else if (dx + dy) % 3 == 0 { rgb(0xd9a822) } else { rgb(0xf2c84b) };
+                self.set(ax + dx, ay - dy, c);
+            }
+        }
+        for dy in 18..24 {
+            self.set(ax, ay - dy, rgb(0xd9a822));
+        }
+        for dx in -12i32..=12 {
+            self.set(ax + dx, ay + 1, rgb(0xd6cfc0));
+            self.set(ax + dx, ay + 2, if dx % 3 == 0 { OUTLINE } else { rgb(0xe8e2d4) });
+        }
+    }
+
+    /// the Moulin Rouge: a red windmill on its red-fronted cabaret
+    fn moulin_rouge(&mut self, x: i32, y: i32) {
+        let (ax, base) = (x / S, (H - y) / S);
+        for dy in 0..10 {
+            for dx in -10i32..=10 {
+                let edge = dx.abs() == 10 || dy == 9;
+                self.set(ax + dx, base - dy, if edge { OUTLINE } else if dy < 3 { rgb(0xffe58a) } else { rgb(0xd8342c) });
+            }
+        }
+        for dy in 10..20 {
+            for dx in -3i32..=3 {
+                self.set(ax + dx, base - dy, if dx.abs() == 3 { OUTLINE } else { rgb(0xc8302c) });
+            }
+        }
+        // the sails
+        for k in -9i32..=9 {
+            self.set(ax + k, base - 20 + k, rgb(0xb22a24));
+            self.set(ax + k, base - 20 - k, rgb(0xb22a24));
+        }
+    }
+
+    /// the obelisk in the Place de la Concorde, between its two fountains
+    fn obelisk(&mut self, x: i32, y: i32) {
+        let (ax, base) = (x / S, (H - y) / S);
+        for py in base - 6..=base + 10 {
+            for px in ax - 20..=ax + 20 {
+                self.set(px, py, if (px + py) % 5 == 0 { PAVE_LINE } else { PAVE });
+            }
+        }
+        for fx in [ax - 14, ax + 14] {
+            self.disc(fx, base + 3, 4, rgb(0x5f8f7a));
+            self.disc(fx, base + 3, 3, rgb(0x8fd0f0));
+        }
+        for dy in 0..26 {
+            let half = if dy < 22 { 1 } else { 0 };
+            for dx in -half..=half {
+                self.set(ax + dx, base - dy, if dx < 0 { rgb(0xe8d7b0) } else { rgb(0xd2bf94) });
+            }
+        }
+        self.set(ax, base - 26, rgb(0xf2c84b));
+    }
+
+    /// the Louvre's glass pyramid in the Cour Napoleon
+    fn pyramid(&mut self, x: i32, y: i32) {
+        let (ax, base) = (x / S, (H - y) / S);
+        for dy in 0i32..12 {
+            let half = 12 - dy;
+            for dx in -half..=half {
+                let edge = dx.abs() == half;
+                self.set(ax + dx, base - dy, if edge { rgb(0x6a8aa8) } else if (dx + dy) % 3 == 0 { rgb(0x9fd3f0) } else { rgb(0xc9e6f6) });
+            }
+        }
+    }
+
+    /// the Grand Hotel: a vast red palace with golden-yellow roofs on a green hillside
+    fn grand_hotel(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        for (dx, w, h, roof_rows) in [(-30, 60, 22, 6), (-10, 20, 30, 8)] {
+            let (hx, hy) = (ax + dx, ay - h);
+            for ry in 0..h {
+                for rx in 0..w {
+                    let c = if ry < roof_rows {
+                        if ry % 2 == 0 { rgb(0xe8b832) } else { rgb(0xd9a822) }
+                    } else if rx % 3 == 1 && ry % 3 == 0 {
+                        rgb(0xffe58a)
+                    } else {
+                        rgb(0xc8302c)
+                    };
+                    self.set(hx + rx, hy + ry, c);
+                }
+            }
+            self.outline(hx, hy, w, h);
+        }
+    }
+
+    /// the National Palace Museum: a long cream hall under green-tiled roofs, up its terraces
+    fn palace_museum(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        for py in ay..=ay + 10 {
+            for px in ax - 20..=ax + 20 {
+                self.set(px, py, if py % 3 == 0 { rgb(0xd9d2c4) } else { rgb(0xe8e2d4) }); // the terraces
+            }
+        }
+        for (hx, w, h) in [(ax - 24, 48, 14), (ax - 10, 20, 20)] {
+            let hy = ay - h;
+            for ry in 0..h {
+                for rx in 0..w {
+                    let c = if ry < 5 { if ry % 2 == 0 { rgb(0x3f8f5a) } else { rgb(0x2f7a4a) } } else if rx % 4 == 1 { rgb(0xd9c9a3) } else { rgb(0xf3ead2) };
+                    self.set(hx + rx, hy + ry, c);
+                }
+            }
+            self.outline(hx, hy, w, h);
+        }
+    }
+
+    /// a hill rising out of the city, seen from above (Elephant Mountain), with a lookout
+    fn hill(&mut self, x: i32, y: i32, rx: i32, ry: i32) {
+        let (cx, cy) = (x / S, (H - y) / S);
+        for ay in cy - ry..=cy + ry {
+            for ax in cx - rx..=cx + rx {
+                let d = ((ax - cx) as f64 / rx as f64).powi(2) + ((ay - cy) as f64 / ry as f64).powi(2);
+                if d > 1.0 || !self.free_art(ax, ay) {
+                    continue;
+                }
+                let c = if d > 0.85 { TREE_DARK } else if d < 0.15 { rgb(0x4f9a44) } else if (ax * 7 + ay * 3) % 9 == 0 { TREE_LIGHT } else { TREE };
+                self.set(ax, ay, c);
+            }
+        }
+        self.set(cx, cy, rgb(0xd8ceb6));
+        self.set(cx + 1, cy, rgb(0xd8ceb6));
+    }
+
+    /// the Maokong gondola: cabins hanging on a cable from (x0, y0) up to (x1, y1)
+    fn gondola(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let (ax0, ay0, ax1, ay1) = (x0 / S, (H - y0) / S, x1 / S, (H - y1) / S);
+        let steps = (ax1 - ax0).abs().max((ay1 - ay0).abs()).max(1);
+        for k in 0..=steps {
+            let (ax, ay) = (ax0 + (ax1 - ax0) * k / steps, ay0 + (ay1 - ay0) * k / steps);
+            self.set(ax, ay, rgb(0x3a3c42));
+            if k % 14 == 7 {
+                for (dx, dy) in [(0, 1), (-1, 2), (0, 2), (1, 2), (-1, 3), (0, 3), (1, 3)] {
+                    self.set(ax + dx, ay + dy, if dy == 1 { rgb(0x3a3c42) } else if (k / 14) % 2 == 0 { rgb(0x3fae49) } else { rgb(0xf2c84b) });
+                }
+            }
+            if k % 60 == 0 {
+                for dy in 0..8 {
+                    self.set(ax, ay + dy, rgb(0x8d8f96)); // a pylon
+                }
+            }
+        }
+    }
+
+    /// the Red House in Ximending: an octagonal red-brick theatre
+    fn red_house(&mut self, x: i32, y: i32) {
+        let (ax, ay) = (x / S, (H - y) / S);
+        for dy in -8i32..=8 {
+            for dx in -8i32..=8 {
+                if dx.abs() + dy.abs() > 11 {
+                    continue;
+                }
+                let edge = dx.abs() == 8 || dy.abs() == 8 || dx.abs() + dy.abs() == 11;
+                self.set(ax + dx, ay + dy, if edge { OUTLINE } else if (dx + dy) % 3 == 0 { rgb(0x9a3a2a) } else { rgb(0xb5523b) });
+            }
+        }
+        self.disc(ax, ay, 2, rgb(0x5a5c63));
+        // the shopping street's neon signs round it
+        for k in 0..6 {
+            self.billboard(ax - 26 + k * 10, ay + 18, k as usize);
+        }
+    }
+
+    /// a Ferris wheel standing side-on: its rim, spokes and gondolas, on two legs
+    fn ferris(&mut self, x: i32, y: i32, rim: u32) {
+        let (ax, base) = (x / S, (H - y) / S);
+        let (cx, cy, r) = (ax, base - 24, 20);
+        for k in 0..120 {
+            let a = k as f64 * PI / 60.0;
+            self.set(cx + (r as f64 * a.cos()) as i32, cy + (r as f64 * a.sin()) as i32, rim);
+            if k % 15 == 0 {
+                for t in 0..r {
+                    self.set(cx + (t as f64 * a.cos()) as i32, cy + (t as f64 * a.sin()) as i32, rgb(0x8d8f96));
+                }
+                let (gx, gy) = (cx + ((r + 2) as f64 * a.cos()) as i32, cy + ((r + 2) as f64 * a.sin()) as i32);
+                self.set(gx, gy, NEON[(k / 15) as usize % NEON.len()]);
+            }
+        }
+        for t in 0..24 {
+            self.set(cx - t / 3, cy + t, rgb(0x5a5c63));
+            self.set(cx + t / 3, cy + t, rgb(0x5a5c63));
+        }
+    }
+
+    /// a district of `style` buildings in the box, kept clear of the city's general fill
+    fn area(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, style: &str) {
+        self.district(x0, y0, x1, y1, style);
+        self.reserve(x0, y0, x1, y1);
+    }
+
+}
+
 // ================================================================== the maps
+//
+// Each city's landmarks stand where these say; web/src/render/landmarks.ts builds the 3D models
+// on the same spots (and finds the same stretches of track for the bridges and gates).
 
 fn paint_tokyo() -> City {
-    // the Sumida river runs across the top half; the route crosses it on three bridges
+    // the Sumida river across the west, Tokyo Bay to the east: the Rainbow Bridge carries the
+    // track over to Odaiba
     let mut c = City::new(
         "tokyo",
         |x, y| {
             let (x, y) = (x as f64, y as f64);
-            y > 720.0 + 8.0 * sin(x / 61.0) && y < 800.0 + 8.0 * sin(x / 61.0) || x > 1850.0 + 5.0 * sin(y / 29.0)
+            let river = y > 690.0 + 8.0 * sin(x / 61.0) && y < 752.0 + 8.0 * sin(x / 61.0) && x < 2000.0;
+            let bay = x > 1990.0 + 10.0 * sin(y / 43.0) && y > 470.0 + 8.0 * sin(x / 37.0);
+            river || bay
         },
         1964,
     );
     c.ground(rgb(0x7cc25a), rgb(0x67ad4b));
-    // Shiba park with Tokyo Tower, a shrine in a cherry grove, a garden by the river
-    c.park(1300, 280, 1690, 560, true, false);
-    c.reserve(1300, 280, 1690, 560);
-    c.park(270, 480, 460, 700, true, true);
-    c.reserve(270, 480, 460, 700);
-    c.park(0, 0, 130, 1080, false, true);
-    c.park(0, 0, 450, 150, false, true);
-    // the neighborhoods
-    c.district(270, 300, 450, 470, "tokyo-houses");
-    c.district(590, 300, 930, 350, "tokyo-houses");
-    c.district(590, 490, 1130, 550, "tokyo-shops");
-    c.district(780, 690, 1130, 710, "tokyo-shops");
-    c.district(270, 810, 630, 1080, "tokyo-houses");
-    c.district(1270, 600, 1690, 830, "tokyo-towers");
-    c.district(1270, 960, 1840, 1080, "tokyo-shops");
-    c.district(1130, 960, 1270, 1080, "tokyo-houses");
-    c.train(600, 235, 925, rgb(0x6b4a32), rgb(0x3fae49)); // the Yamanote line
-    c.reserve(590, 200, 935, 275);
-    c.district(780, 820, 1130, 1080, "tokyo-towers");
-    c.district(1070, 270, 1270, 550, "tokyo-towers");
-    c.district(1070, 0, 1840, 130, "tokyo-shops");
-    c.district(500, 0, 930, 160, "tokyo-houses");
-    c.district(580, 820, 640, 1080, "tokyo-houses");
+    c.special_bridges.push(([2300.0, 750.0], WHITE, rgb(0x9aa0a8))); // the Rainbow Bridge
+    c.dress([1154.0, 523.0], [700.0, 600.0], Dress::Neon); // Shibuya
+    c.dress([230.0, 160.0], [450.0, 640.0], Dress::Cherry); // up to the shrine
+    // Meiji Shrine's forest, Shiba Park round Tokyo Tower, the Imperial Palace, Senso-ji
+    c.park(40, 380, 250, 680, true, true);
+    c.reserve(40, 380, 250, 680);
+    c.park(1330, 370, 1720, 640, true, false);
+    c.reserve(1330, 370, 1720, 640);
+    c.reserve(1100, 900, 1500, 1200);
+    c.reserve(200, 960, 520, 1180);
+    c.reserve(110, 1240, 300, 1580);
+    c.reserve(2150, 30, 2380, 190);
+    c.reserve(2500, 60, 2620, 220);
+
+    c.area(780, 300, 1330, 690, "tokyo-towers"); // Shibuya
+    c.area(1700, 760, 1990, 1250, "tokyo-towers");
+    c.area(1990, 0, W, 470, "tokyo-shops"); // Odaiba
+    c.district(0, 0, W, H, "tokyo-houses");
     c.roads(rgb(0xf2f0ea), true);
-    // the Shibuya scramble: zebra stripes across the whole crossing, both diagonals too
-    c.scramble(950, 620);
     c.crosswalks();
-    c.bridges(rgb(0xd8423a), rgb(0xa52f2a), false);
-    c.shrine(365, 590);
-    c.tokyo_tower(1495, 300);
-    c.boat(430, 760, rgb(0xb98a5a), true);
-    c.boat(1000, 752, rgb(0xb98a5a), true);
-    c.boat(1500, 765, rgb(0xb98a5a), true);
-    c.people(220);
+    c.scramble([960.0, 605.0]);
+    c.bridges(rgb(0xd8423a), rgb(0xa52f2a));
+    c.gate([2180.0, 850.0], Gate::Rainbow);
+    c.gate([2420.0, 625.0], Gate::Rainbow);
+    c.gate([390.0, 530.0], Gate::Torii);
+    c.dressing();
+    c.shrine(150, 470);
+    c.tokyo_tower(1525, 430);
+    c.imperial_palace(1300, 1050);
+    c.sensoji(360, 990);
+    c.skytree(205, 1260);
+    c.big_sight(2265, 105);
+    c.gundam(2560, 120);
+    c.boat(500, 722, rgb(0xb98a5a), true);
+    c.boat(1200, 715, rgb(0xb98a5a), true);
+    c.boat(2600, 1200, rgb(0xe9e2d2), false);
+    c.boat(2250, 1450, rgb(0xd9433b), false);
+    c.people(420);
     c.start_line();
     c
 }
 
 fn paint_new_york() -> City {
-    // the East River down the right side (two bridges), the harbor in the bottom left
+    // the East River between Manhattan and Brooklyn (crossed by the Brooklyn Bridge on the main
+    // straight and the Manhattan Bridge at the top), and the harbour in the bottom left
     let mut c = City::new(
         "nyc",
         |x, y| {
             let (xf, yf) = (x as f64, y as f64);
-            (xf > 1420.0 + 10.0 * sin(yf / 53.0) && xf < 1600.0 + 10.0 * sin(yf / 53.0))
-                || (yf < 140.0 + 12.0 * sin(xf / 37.0) && x < 760)
+            (xf > 1300.0 + 12.0 * sin(yf / 53.0) && xf < 1570.0 + 12.0 * sin(yf / 53.0))
+                || (yf < 150.0 + 12.0 * sin(xf / 37.0) && x < 700)
         },
         1898,
     );
     c.ground(rgb(0x74b956), rgb(0x60a447));
-    // Central Park: lawns, the lake with rowboats, Bethesda Fountain, paths
-    c.central_park(640, 600, 1330, 830);
-    c.reserve(640, 600, 1330, 830);
-    c.times_square(940, 0, 1170, 450);
-    c.reserve(940, 0, 1170, 450);
-    // room for the Empire State Building
-    c.reserve(470, 290, 650, 660);
-    c.district(270, 300, 790, 630, "nyc-towers");
-    c.district(270, 770, 490, 1080, "nyc-brownstones");
-    c.district(640, 970, 1410, 1080, "nyc-brownstones");
-    c.district(1620, 270, 1690, 830, "nyc-brownstones");
-    c.district(1830, 0, 1920, 1080, "nyc-brownstones");
-    c.district(1620, 970, 1830, 1080, "nyc-brownstones");
-    c.district(1310, 270, 1400, 830, "nyc-towers");
-    c.district(940, 590, 1170, 600, "nyc-towers");
-    c.district(1610, 0, 1700, 130, "nyc-brownstones");
-    c.district(0, 0, 130, 1080, "nyc-brownstones");
-    c.district(770, 140, 930, 450, "nyc-towers");
-    c.district(1250, 0, 1400, 130, "nyc-towers");
-    c.district(130, 770, 270, 1080, "nyc-brownstones");
-    // a plaza around the Empire State Building
-    for ay in (H - 660) / S..=(H - 290) / S {
-        for ax in 470 / S..=650 / S {
-            if c.road_distance(ax * S + 1, H - 1 - ay * S) > ROAD + WALK + S {
-                c.set(ax, ay, if ax % 8 == 0 || ay % 8 == 0 { PAVE_LINE } else { PAVE });
-            }
-        }
+    c.special_bridges.push(([1430.0, 1490.0], rgb(0x6f9ac8), rgb(0x3f6a98))); // the Manhattan Bridge
+    c.dress([1050.0, 1300.0], [620.0, 1110.0], Dress::Neon); // Times Square
+    c.dress([520.0, 990.0], [600.0, 640.0], Dress::Trees); // through Central Park
+    // Central Park round the drive, room for the towers and Rockefeller Center
+    c.central_park(480, 560, 1000, 1000);
+    c.reserve(480, 560, 1000, 1000);
+    for (x, y) in [(1150, 470), (1100, 830), (1240, 1010), (820, 510), (910, 1300), (2560, 230)] {
+        c.reserve(x - 70, y - 60, x + 70, y + 160);
     }
-    c.empire_state(560, 420);
-    c.flatiron(1355, 320);
+    c.area(0, 0, 1300, H, "nyc-towers");
+    c.area(1570, 0, W, H, "nyc-brownstones"); // Brooklyn
+    c.area(0, 1150, 480, H, "nyc-brownstones"); // Harlem
     c.roads(rgb(0xf6d24a), false);
     c.crosswalks();
-    c.bridges(rgb(0xb9a481), rgb(0x8a7a5e), true);
+    c.bridges(rgb(0xb9a481), rgb(0x8a7a5e));
+    c.gate([1350.0, 215.0], Gate::Brooklyn);
+    c.gate([1525.0, 170.0], Gate::Brooklyn);
+    c.dressing();
+    c.tiers(1150, 470, &[(10, 46, rgb(0x9fc4dc)), (7, 30, rgb(0xb8d4e6)), (4, 16, rgb(0xcfe2ee))], 18, rgb(0xd9dde3)); // One World Trade Center
+    c.empire_state(1100, 830);
+    c.tiers(1240, 1010, &[(9, 40, rgb(0xd9d4ca)), (6, 14, rgb(0xe8e4dc)), (4, 8, rgb(0xc9ced6)), (2, 8, rgb(0xd9dde3))], 12, rgb(0xd9dde3)); // the Chrysler Building
+    c.flatiron(820, 510);
+    c.rockefeller(910, 1300);
+    c.ferris(2560, 230, rgb(0xd9433b)); // Coney Island's Wonder Wheel
     c.liberty(330, 60);
-    c.boat(620, 70, rgb(0xf08a2e), false); // the Staten Island Ferry
-    c.boat(1470, 600, rgb(0xd9433b), false);
-    c.boat(1500, 330, rgb(0xe9e2d2), false);
-    c.people(260);
+    c.boat(560, 70, rgb(0xf08a2e), false); // the Staten Island Ferry
+    c.boat(1430, 700, rgb(0xd9433b), false);
+    c.boat(1440, 1100, rgb(0xe9e2d2), false);
+    c.people(380);
     c.start_line();
     c
 }
 
 fn paint_chicago() -> City {
-    // the Chicago River across the middle (two bridges), Lake Michigan down the right
+    // the Chicago River across the city into Monroe Harbor, Lake Michigan down the east side
     let mut c = City::new(
         "chicago",
         |x, y| {
             let (xf, yf) = (x as f64, y as f64);
-            (yf > 548.0 + 3.0 * sin(xf / 41.0) && yf < 606.0 + 3.0 * sin(xf / 41.0) && x < 1640)
-                || xf > 1680.0 + 8.0 * sin(yf / 47.0)
+            let river = yf > 1150.0 + 3.0 * sin(xf / 41.0) && yf < 1210.0 + 3.0 * sin(xf / 41.0) && xf < 2050.0;
+            let harbor = ((xf - 2210.0) / 180.0).powi(2) + ((yf - 900.0) / 220.0).powi(2) < 1.0;
+            let lake = xf > 2770.0 + 8.0 * sin(yf / 47.0);
+            river || harbor || lake
         },
         1871,
     );
     c.water_color = rgb(0x3f9a9c);
     c.water_dark = rgb(0x337f84);
     c.ground(rgb(0x76bb57), rgb(0x62a748));
-    c.millennium_park(1190, 250, 1410, 520);
-    c.reserve(1190, 250, 1410, 520);
-    c.reserve(270, 300, 560, 530); // Willis Tower's plaza
-    c.district(270, 300, 560, 530, "chi-towers");
-    c.district(580, 290, 1030, 360, "chi-towers");
-    c.district(270, 630, 830, 830, "chi-towers");
-    c.district(970, 770, 1630, 1080, "chi-towers");
-    c.district(270, 970, 960, 1080, "chi-houses");
-    c.district(0, 0, 130, 1080, "chi-houses");
-    c.district(0, 0, 1040, 160, "chi-houses");
-    c.district(1170, 0, 1640, 90, "chi-houses");
-    c.district(970, 630, 1430, 640, "chi-towers");
-    c.district(1570, 0, 1640, 1080, "chi-towers");
-    c.district(730, 160, 1010, 290, "chi-houses");
-    c.train(980, 800, 1620, rgb(0x8a4a2a), rgb(0x3f6fbf)); // the L on its elevated tracks
-    c.reserve(970, 780, 1630, 830);
-    c.willis_tower(420, 320);
+    c.dress([2432.0, 503.0], [2536.0, 1056.0], Dress::Trees); // Lake Shore Drive
+    // Grant Park with Buckingham Fountain and Millennium Park, Soldier Field, Wrigley Field
+    c.millennium_park(1180, 560, 1480, 800);
+    c.reserve(1180, 560, 1480, 800);
+    c.park(880, 400, 1180, 640, true, false);
+    c.reserve(880, 400, 1180, 640);
+    for (x, y, w, h) in [(700, 1000, 80, 160), (1080, 1300, 60, 160), (900, 1240, 100, 140), (2420, 150, 130, 90), (650, 1330, 120, 120)] {
+        c.reserve(x - w, y - h, x + w, y + h);
+    }
+
+    c.area(560, 640, 1800, 1500, "chi-towers"); // the Loop
+    c.train(150, 440, 900, rgb(0x8a4a2a), rgb(0x3f6fbf)); // the L
+    c.district(0, 0, W, H, "chi-houses");
     c.roads(rgb(0xf6d24a), false);
     c.crosswalks();
-    c.bridges(rgb(0xc0453a), rgb(0x7a2a24), false);
-    c.navy_pier(1700, 820);
-    c.boat(700, 575, rgb(0xe9e2d2), false); // an architecture tour boat
-    c.boat(1780, 400, rgb(0xd9433b), false);
-    c.people(240);
+    c.bridges(rgb(0xc0453a), rgb(0x7a2a24));
+    c.gate([454.0, 440.0], Gate::ElevatedRail);
+    c.dressing();
+    c.willis_tower(700, 1000);
+    c.tiers(1080, 1300, &[(9, 52, rgb(0x3a3c42)), (7, 6, rgb(0x2a2a30))], 16, rgb(0xd9dde3)); // the John Hancock Center
+    c.marina_city(900, 1240);
+    c.fountain(1030, 520);
+    c.ballpark(650, 1330, true); // Wrigley Field
+    c.stadium(2420, 150); // Soldier Field
+    c.navy_pier(2770, 1460);
+    c.boat(2150, 950, WHITE, false);
+    c.boat(2260, 820, WHITE, false);
+    c.boat(1300, 1180, rgb(0xe9e2d2), false); // an architecture tour boat
+    c.people(380);
     c.start_line();
     c
 }
 
 fn paint_london() -> City {
-    // the Thames through the middle: Westminster Bridge on the left, Tower Bridge on the right
+    // the Thames winding across the middle: Westminster Bridge on the left, Tower Bridge in the
+    // middle, and more crossings besides
     let mut c = City::new(
         "london",
         |x, y| {
             let (x, y) = (x as f64, y as f64);
-            y > 630.0 + 10.0 * sin(x / 90.0) && y < 752.0 + 8.0 * sin(x / 70.0 + 1.0)
+            y > 640.0 + 14.0 * sin(x / 140.0) && y < 760.0 + 12.0 * sin(x / 110.0 + 1.0)
         },
         1666,
     );
     c.water_color = rgb(0x4f86a8);
     c.water_dark = rgb(0x416f8f);
     c.ground(rgb(0x72b755), rgb(0x5ea246));
-    c.park(0, 0, 130, 1080, true, false); // Hyde Park
-    c.park(830, 250, 1230, 620, true, false); // St James's Park
-    c.forest(1070, 770, 1690, 930, 0.0, 1400); // the South Bank
-    c.reserve(270, 500, 930, 625); // Parliament and Big Ben
-    c.district(270, 300, 420, 400, "london-terraces");
-    c.district(270, 940, 930, 1080, "london-terraces");
-    c.district(1370, 250, 1690, 450, "london-city");
-    c.district(1370, 0, 1920, 120, "london-terraces");
-    c.district(700, 0, 1240, 110, "london-terraces");
-    c.district(0, 0, 690, 160, "london-terraces");
-    c.district(1840, 0, 1920, 1080, "london-terraces");
-    c.district(1070, 1040, 1700, 1080, "london-terraces");
-    c.district(560, 280, 690, 380, "london-terraces");
-    c.district(1380, 120, 1830, 250, "london-terraces");
-    c.parliament(360, 520);
-    c.big_ben(330, 515);
-    c.buckingham(1030, 400);
-    c.reserve(830, 250, 1230, 620);
-    c.london_eye(1380, 830);
-    c.reserve(1300, 760, 1470, 930);
-    c.st_pauls(1450, 380);
-    c.gherkin(1610, 300);
+    c.special_bridges.push(([150.0, 720.0], rgb(0x3f7f5a), rgb(0x2a5a40))); // Westminster Bridge
+    c.special_bridges.push(([1880.0, 690.0], rgb(0x4f7fbf), rgb(0x2f5f9f))); // Tower Bridge
+    c.dress([1350.0, 410.0], [560.0, 480.0], Dress::Red); // the Mall
+    // St James's Park by the Mall, Hyde Park, the South Bank
+    c.park(560, 160, 1250, 380, true, false); // St James's Park
+    c.park(0, 860, 220, 1620, true, false); // Hyde Park
+    for (x, y, w, h) in [(905, 830, 285, 60), (640, 600, 80, 70), (420, 320, 110, 60), (1300, 270, 70, 60), (1150, 1240, 70, 80), (1600, 1350, 50, 90), (2180, 520, 50, 120), (2150, 900, 100, 80)] {
+        c.reserve(x - w, y - h, x + w, y + h);
+    }
+
+    c.area(1250, 800, 2400, 1250, "london-city"); // the City
+    c.district(0, 0, W, H, "london-terraces");
     c.roads(rgb(0xf2f0ea), false);
     c.crosswalks();
-    c.bridges(rgb(0x3f7f5a), rgb(0x2a5a40), false);
-    c.tower_bridge(1760, 690);
-    c.boat(800, 700, rgb(0xe9e2d2), false);
-    c.boat(1400, 690, rgb(0xd9433b), false);
+    c.bridges(rgb(0x9b958c), rgb(0x6f6a62));
+    c.gate([1880.0, 690.0], Gate::TowerBridge);
+    c.dressing();
+    c.parliament(660, 780);
+    c.big_ben(630, 775);
+    c.london_eye(640, 600);
+    c.buckingham(420, 320);
+    c.nelson(1300, 230);
+    c.st_pauls(1150, 1200);
+    c.gherkin(1600, 1300);
+    c.taper(2180, 440, 14, 1, 70, rgb(0x9fc4dc), true); // the Shard
+    c.tower_of_london(2150, 900);
+    c.boat(900, 700, rgb(0xe9e2d2), false);
+    c.boat(1600, 690, rgb(0xd9433b), false);
+    c.boat(2500, 700, rgb(0xe9e2d2), false);
     c.phone_boxes();
-    c.people(240);
+    c.people(380);
     c.start_line();
     c
 }
 
 fn paint_paris() -> City {
-    // the Seine across the middle, with stone bridges on both crossings
+    // the Seine across the middle, round the Ile de la Cite; Pont Alexandre III on the left
     let mut c = City::new(
         "paris",
         |x, y| {
             let (x, y) = (x as f64, y as f64);
-            y > 512.0 + 5.0 * sin(x / 70.0) && y < 604.0 + 5.0 * sin(x / 70.0 + 2.0)
+            let island = ((x - 1560.0) / 170.0).powi(2) + ((y - 565.0) / 36.0).powi(2) < 1.0;
+            y > 520.0 + 6.0 * sin(x / 70.0) && y < 616.0 + 6.0 * sin(x / 70.0 + 2.0) && !island
         },
         1889,
     );
     c.water_color = rgb(0x4d8db8);
     c.water_dark = rgb(0x3f769e);
     c.ground(rgb(0x7abb5c), rgb(0x66a74c));
-    c.champ_de_mars(780, 620, 1420, 850);
-    c.reserve(780, 620, 1420, 860);
-    c.arc_de_triomphe(1430, 370);
-    c.reserve(1300, 240, 1560, 500);
-    c.louvre(830, 300);
-    c.reserve(620, 250, 1040, 350);
-    c.notre_dame(380, 400);
-    c.reserve(310, 390, 450, 510);
-    c.sacre_coeur(465, 900);
-    c.reserve(300, 820, 630, 1000);
-    c.district(1180, 250, 1690, 500, "paris-haussmann");
-    c.district(270, 300, 490, 495, "paris-cafes");
-    c.district(140, 790, 650, 1080, "paris-haussmann");
-    c.district(0, 0, 130, 1080, "paris-haussmann");
-    c.district(0, 0, 1030, 160, "paris-cafes");
-    c.district(1170, 0, 1920, 110, "paris-haussmann");
-    c.district(770, 1000, 1920, 1080, "paris-haussmann");
-    c.district(1570, 770, 1690, 1080, "paris-haussmann");
-    c.district(1830, 0, 1920, 1080, "paris-haussmann");
-    c.district(620, 350, 1040, 360, "paris-cafes");
-    c.eiffel(1100, 650);
+    c.special_bridges.push(([953.0, 574.0], rgb(0xd9a822), rgb(0xa8822a))); // Pont Alexandre III
+    c.dress([1809.0, 1349.0], [2140.0, 930.0], Dress::Cobbles); // the Champs-Elysees
+    // the Champ de Mars under the Eiffel Tower, the Tuileries by the Louvre
+    c.champ_de_mars(430, 250, 770, 470);
+    c.reserve(430, 250, 770, 480);
+    c.park(1050, 700, 1300, 960, true, false); // the Tuileries
+    for (x, y, w, h) in [(1600, 1380, 110, 110), (1420, 820, 160, 80), (1090, 650, 70, 50), (1560, 565, 170, 40), (360, 1250, 140, 120), (560, 1450, 60, 60), (1330, 330, 90, 70)] {
+        c.reserve(x - w, y - h, x + w, y + h);
+    }
+
+    c.area(1100, 1000, 1700, 1250, "paris-cafes");
+    c.area(0, 900, 700, H, "paris-cafes"); // Montmartre
+    c.district(0, 0, W, H, "paris-haussmann");
     c.roads(rgb(0xf2f0ea), true);
     c.crosswalks();
-    c.bridges(rgb(0xd8ceb6), rgb(0xa89c82), false);
-    c.boat(800, 560, rgb(0xe9e2d2), false); // bateaux mouches
-    c.boat(1450, 555, rgb(0xe9e2d2), false);
-    c.people(260);
+    c.bridges(rgb(0xd8ceb6), rgb(0xa89c82));
+    c.gate([953.0, 574.0], Gate::Alexandre);
+    c.dressing();
+    c.eiffel(600, 360);
+    c.arc_de_triomphe(1600, 1380);
+    c.louvre(1420, 820);
+    c.pyramid(1420, 760);
+    c.obelisk(1090, 650);
+    c.notre_dame(1560, 560);
+    c.sacre_coeur(360, 1250);
+    c.moulin_rouge(560, 1440);
+    c.invalides(1330, 340);
+    c.boat(700, 565, rgb(0xe9e2d2), false); // bateaux mouches
+    c.boat(2300, 560, rgb(0xe9e2d2), false);
+    c.people(400);
     c.start_line();
     c
 }
 
 fn paint_taipei() -> City {
-    // the Keelung river across the left and up to the top, crossed twice
+    // the Keelung river across the south west, Yangmingshan's hills across the top left
     let mut c = City::new(
         "taipei",
         |x, y| {
             let (xf, yf) = (x as f64, y as f64);
-            (yf > 726.0 + 4.0 * sin(xf / 37.0) && yf < 788.0 + 4.0 * sin(xf / 37.0) && x < 1150)
-                || (xf > 1080.0 + 4.0 * sin(yf / 29.0) && xf < 1150.0 + 4.0 * sin(yf / 29.0) && y > 726)
+            yf > 520.0 + 6.0 * sin(xf / 37.0) && yf < 586.0 + 6.0 * sin(xf / 37.0) && xf < 1250.0
         },
         1949,
     );
     c.water_color = rgb(0x4a93b8);
     c.water_dark = rgb(0x3e7d9e);
     c.ground(rgb(0x6fb653), rgb(0x5aa044));
-    c.hills(0, 960, 1060, 1080); // Yangmingshan behind the city
-    c.park(0, 0, 130, 960, true, false);
-    c.reserve(270, 300, 740, 650); // Chiang Kai-shek Memorial Hall
-    c.reserve(1310, 250, 1690, 570); // Longshan Temple
-    c.reserve(870, 250, 1170, 360); // Shilin Night Market
-    c.taipei101(1540, 760);
-    c.reserve(1480, 740, 1600, 1080); // Taipei 101
-    c.district(1170, 960, 1920, 1080, "taipei-shops");
-    c.district(1380, 720, 1700, 1080, "taipei-towers");
-    c.district(0, 0, 1250, 160, "taipei-shops");
-    c.district(860, 490, 1700, 570, "taipei-shops");
-    c.district(1170, 720, 1240, 830, "taipei-shops");
-    c.district(270, 820, 1010, 830, "taipei-shops");
-    c.district(1830, 0, 1920, 1080, "taipei-shops");
-    c.district(270, 800, 1000, 840, "taipei-houses");
-    c.district(1250, 0, 1920, 110, "taipei-houses");
-    c.district(760, 590, 1210, 710, "taipei-shops");
-    c.district(290, 660, 760, 710, "taipei-houses");
-    c.district(880, 170, 1160, 250, "taipei-shops");
-    c.cks_memorial(500, 470);
-    c.longshan(1500, 420);
-    c.night_market(880, 260, 1160, 350);
+    c.dress([1800.0, 200.0], [950.0, 170.0], Dress::Lanterns); // Shilin Night Market
+    c.hills(0, 1330, 760, H); // Yangmingshan behind the city
+    c.reserve(0, 1330, 760, H);
+    c.park(1960, 900, 2500, 1260, true, false);
+    for (x, y, w, h) in [(1700, 950, 60, 200), (660, 760, 200, 160), (1450, 720, 160, 120), (950, 1420, 110, 80), (1450, 1470, 90, 70), (2230, 1080, 120, 90), (360, 220, 90, 70)] {
+        c.reserve(x - w, y - h, x + w, y + h);
+    }
+
+    c.area(1550, 600, 2000, 1250, "taipei-towers"); // Xinyi
+    c.area(1950, 0, W, 600, "taipei-houses");
+    c.district(0, 0, W, H, "taipei-shops");
     c.roads(rgb(0xf2f0ea), true);
     c.crosswalks();
-    c.bridges(rgb(0xd8423a), rgb(0xa52f2a), false);
+    c.bridges(rgb(0xd8423a), rgb(0xa52f2a));
+    c.dressing();
+    c.taipei101(1700, 830);
+    c.cks_memorial(660, 760);
+    c.longshan(1450, 720);
+    c.grand_hotel(950, 1420);
+    c.palace_museum(1450, 1470);
+    c.hill(2230, 1080, 34, 24); // Elephant Mountain
+    c.gondola(2520, 300, 2840, 820); // the Maokong gondola
+    c.red_house(360, 220); // Ximending
     c.scooters();
-    c.people(300);
+    c.people(420);
     c.start_line();
     c
 }

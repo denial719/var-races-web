@@ -871,11 +871,12 @@ mod tests {
             }
         }
         times.sort_by(f32::total_cmp);
-        // Previous driver, same item-free fixture: 65 wall + 193 contact episodes,
-        // median 34.966305 s. Require >=75% fewer episodes and <=25% slowdown.
+        // Previous driver, same item-free fixture: 65 wall + 193 contact episodes. Require >=75%
+        // fewer episodes, and no more than 25% slower than the median of 47.266117 s measured
+        // when the city circuits became street circuits (longer laps than the old city maps).
         assert!(longest_stall < 5.0, "stuck for {longest_stall}s");
         assert!(impacts + contacts <= 64, "{impacts} walls + {contacts} contacts");
-        assert!(times[times.len()/2] <= 34.966305 * 1.25);
+        assert!(times[times.len() / 2] <= 47.266117 * 1.25);
         println!("TRAFFIC: {impacts} wall episodes, {contacts} car contact episodes, median {}s, longest stall {longest_stall}s", times[times.len()/2]);
     }
 

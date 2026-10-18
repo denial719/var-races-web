@@ -382,9 +382,16 @@ export class Hud {
         }
         g.stroke();
       }
-      // the start line, and on a sprint a checkered flag at the finish
-      g.fillStyle = '#fff';
-      g.fillRect(px(136), py(300) - 1, 128 * scale, 2.5);
+      // the start line straight across the road, and on a sprint a checkered flag at the finish
+      const [sx, sy, heading] = m.start;
+      const ax = Math.sin(heading) * 64, ay = -Math.cos(heading) * 64;
+      g.strokeStyle = '#fff';
+      g.lineWidth = 2.5;
+      g.lineCap = 'butt';
+      g.beginPath();
+      g.moveTo(px(sx - ax), py(sy - ay));
+      g.lineTo(px(sx + ax), py(sy + ay));
+      g.stroke();
       if (m.kind === 'sprint') {
         const f = pts[pts.length - 2];
         for (let cy = 0; cy < 3; cy++) {

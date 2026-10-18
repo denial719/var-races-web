@@ -82,8 +82,8 @@ impl Course {
                 ((here - prev).norm() + (next - here).norm()).norm()
             })
             .collect();
-        // at the start the "bisector" is the painted line itself: straight across at y = 300
-        bisector[0] = Vec2::new(0.0, 1.0);
+        // at the start the "bisector" is the painted line itself: straight across the road
+        bisector[0] = Vec2::new(crate::math::cos(map.start.2), crate::math::sin(map.start.2));
         if open {
             // a sprint's finish line is straight across the last stretch
             bisector[n - 1] = (path[n - 1] - path[n - 2]).norm();
@@ -285,7 +285,7 @@ mod tests {
         let mut course = Course::new(map);
         course.set_laps(laps);
         let mut s = Standing::default();
-        let start = maps::grid_slot(4).pos;
+        let start = maps::grid_slot(map, 4).pos;
         course.update(&mut s, start, 0.0);
         let mut last = s.progress;
         let pts = map.waypoint_list();
@@ -305,7 +305,8 @@ mod tests {
             }
         }
         // a little past the line
-        course.update(&mut s, pos + Vec2::new(0.0, 10.0), t);
+        let ahead = Vec2::new(crate::math::cos(map.start.2), crate::math::sin(map.start.2));
+        course.update(&mut s, pos + ahead * 10.0, t);
         s
     }
 
@@ -328,11 +329,14 @@ mod tests {
 
     #[test]
     fn grid_starts_behind_the_line() {
-        let map = maps::get("classic");
-        let course = Course::new(map);
-        let mut s = Standing::default();
-        course.update(&mut s, maps::grid_slot(4).pos, 0.0);
-        assert!(s.progress < 0.0 && s.lap == -1);
+        for map in maps::ALL.iter().filter(|m| m.kind == MapKind::Circuit) {
+            let course = Course::new(map);
+            for slot in 0..12 {
+                let mut s = Standing::default();
+                course.update(&mut s, maps::grid_slot(map, slot).pos, 0.0);
+                assert!(s.progress < 0.0 && s.lap == -1, "{} slot {slot}", map.id);
+            }
+        }
     }
 
     #[test]
