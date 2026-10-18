@@ -42,6 +42,12 @@ export function carFrame(c: CarSnapshot, from?: CarSnapshot, t = 1): CarFrame {
     y: p.car.pos.y + (c.car.pos.y - p.car.pos.y) * t,
     heading: lerpAngle(p.car.heading, c.car.heading, t),
     look: { frozen: c.car.freeze > 0, burning: Math.max(0, c.car.burn) },
+    steer: c.car.steer,
+    speed: Math.hypot(c.car.vel.x, c.car.vel.y),
+    vx: c.car.vel.x,
+    vy: c.car.vel.y,
+    boost: c.car.mana / 100,
+    boosting: c.car.boosting,
   };
 }
 

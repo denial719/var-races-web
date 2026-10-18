@@ -298,10 +298,13 @@ export class CarView {
   private modelMaterials: THREE.MeshBasicMaterial[] = [];
   private inside = false;
   private disposed = false;
+  /** the body paint, once it's known (for crash debris) */
+  body: Rgb | null = null;
 
   constructor(readonly spriteName: string, private readonly opacity = 1) {
     void bodyColor(spriteName).then((body) => {
       if (this.disposed) return;
+      this.body = body;
       this.models = [false, true].map((inside) => buildModel(shapeOf(spriteName), body, inside));
       for (const model of this.models) {
         this.root.add(model.group);

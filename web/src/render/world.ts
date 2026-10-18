@@ -16,6 +16,9 @@ import { hill, hillsOn, lift, liftAll, setHills, slope } from './hills';
 import { buildClassic, groundWithoutProps } from './classic';
 import { buildScenery } from './scenery';
 import { buildSky, skyColors, type SkyColors } from './sky';
+import { SkidMarks } from './skids';
+import { Puffs } from './puffs';
+import { CAR_L } from './cars';
 import { barrier, chevrons } from './textures';
 
 const FOG_START = 700;
@@ -30,6 +33,15 @@ export interface CarFrame {
   y: number;
   heading: number;
   look: CarLook;
+  /** how far the wheels are turned (-1..1) and how fast the car is going (px/s), for skid marks */
+  steer?: number;
+  speed?: number;
+  /** velocity (px/s), for how hard a crash was */
+  vx?: number;
+  vy?: number;
+  /** the boost tank (0..1) and whether it's boosting, for the boost puffs */
+  boost?: number;
+  boosting?: boolean;
 }
 
 export interface Frame {
@@ -51,6 +63,11 @@ export class World {
   private readonly occluders = new Occluders(this.environment);
   private readonly sky: THREE.Group;
   private readonly items: ItemsView;
+  private readonly skids = new SkidMarks();
+  private readonly puffs = new Puffs();
+  /** the track walls, and the cars as last drawn, for finding where a crash happened */
+  private readonly walls: Wall[];
+  private lastCars: CarFrame[] = [];
   private readonly ownedTextures: THREE.Texture[] = [];
   private readonly cars = new Map<number, CarView>();
   private mode: CameraMode = 'thirdPerson';
@@ -69,9 +86,10 @@ export class World {
     this.scene.fog = this.fog;
     setHills(map.id);
     hillsOn(true);
+    this.walls = layout.walls;
     this.addWalls(layout.walls, layout.signs);
     this.items = new ItemsView(layout.boxes.flat().map((p) => [p.x, p.y]));
-    this.scene.add(this.items.root);
+    this.scene.add(this.items.root, this.skids.root, this.puffs.root);
   }
 
   /** builds a map's world (the ground picture is loaded before it's ready) */
@@ -267,6 +285,8 @@ export class World {
   /** the cars in the race and their sprites (cars not listed are removed) */
   setCars(cars: { slot: number; sprite: string }[]): void {
     const keep = new Set(cars.map((c) => c.slot));
+    this.skids.keep(keep);
+    this.puffs.keep(keep);
     for (const [slot, view] of this.cars) {
       if (!keep.has(slot)) {
         this.scene.remove(view.root);
@@ -311,6 +331,9 @@ export class World {
       }
       if (c.slot === frame.follow) target = c;
     }
+    this.puffs.skid(this.skids.update(frame.cars, delta), delta);
+    this.puffs.update(frame.cars, delta);
+    this.lastCars = frame.cars;
     const pose = target ? { ...target, z: hill(target.x, target.y) } : null;
     if (pose) {
       const view = target ? this.cars.get(target.slot) : null;
@@ -319,6 +342,50 @@ export class World {
     }
     this.items.update(frame.items, this.rig.camera.position, delta);
     liftAll(this.items.root);
+  }
+
+  /**
+   * A car crashed (into a wall or another car): pieces of it fly from where it hit, which is
+   * whichever is nearer, the closest wall or the closest car.
+   */
+  crash(slot: number): void {
+    const car = this.lastCars.find((c) => c.slot === slot);
+    if (!car) return;
+    // the nearest point on a wall, and how far it is past the car's own edge (half its length)
+    let best: { x: number; y: number; gap: number } | null = null;
+    for (const w of this.walls) {
+      const dx = w.bx - w.ax, dy = w.by - w.ay;
+      const k = Math.max(0, Math.min(1, ((car.x - w.ax) * dx + (car.y - w.ay) * dy) / (dx * dx + dy * dy || 1)));
+      const x = w.ax + dx * k, y = w.ay + dy * k;
+      const gap = Math.hypot(car.x - x, car.y - y) - CAR_L / 2;
+      if (!best || gap < best.gap) best = { x, y, gap };
+    }
+    // the nearest car: they touch about halfway between
+    let other: CarFrame | null = null;
+    for (const c of this.lastCars) {
+      if (c.slot === slot) continue;
+      const gap = Math.hypot(c.x - car.x, c.y - car.y) - CAR_L;
+      if (!best || gap < best.gap) {
+        best = { x: (c.x + car.x) / 2, y: (c.y + car.y) / 2, gap };
+        other = c;
+      }
+    }
+    if (best && best.gap >= CAR_L / 2) other = null;
+    // nothing near (it shouldn't happen): the nose
+    const hit = best && best.gap < CAR_L / 2 ? best : { x: car.x + Math.cos(car.heading) * CAR_L / 2, y: car.y + Math.sin(car.heading) * CAR_L / 2 };
+    // the normal: from the hit toward the car
+    const away = Math.hypot(car.x - hit.x, car.y - hit.y) || 1;
+    const nx = (car.x - hit.x) / away, ny = (car.y - hit.y) / away;
+    // how hard it closed on what it hit, and how fast it scraped along it
+    const vx = car.vx ?? 0, vy = car.vy ?? 0;
+    const rx = vx - (other?.vx ?? 0), ry = vy - (other?.vy ?? 0);
+    const into = rx * nx + ry * ny;
+    this.puffs.crash({
+      x: hit.x, y: hit.y, nx, ny, vx, vy,
+      closing: Math.max(0, -into),
+      slideX: rx - nx * into, slideY: ry - ny * into,
+      body: this.cars.get(slot)?.body ?? null,
+    });
   }
 
   /** stands a car on the hill under it, tilted to the slope */

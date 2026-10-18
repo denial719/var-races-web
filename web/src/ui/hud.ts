@@ -13,7 +13,7 @@ import type { MapDef } from '../wasm';
 const MAX_SPEED_MPH = 240;
 /** the top row needs about this much width before it shrinks */
 const FULL_WIDTH = 1240;
-const BOOST_SEGMENTS = 12;
+export const BOOST_SEGMENTS = 12;
 const ROULETTE_TIME = 0.8;
 const BANNER_TIME = 1.8;
 const ITEM_NAMES = ['nitro', 'rocket', 'oil', 'bubble', 'pulse', 'frost', 'fire'];

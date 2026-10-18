@@ -268,9 +268,12 @@ export class RaceStage implements Stage {
           this.knockedOut = true;
           this.hud.showLabel('KNOCKED OUT', '#fa8072');
         } else audio.play('knockout', 0.4, 1.15);
-      } else if ('Crash' in e && mine(e.Crash.car)) {
-        audio.play('crash', 0.55, audio.random(0.85, 1.15));
-        this.shake = 1.5;
+      } else if ('Crash' in e) {
+        this.w.crash(e.Crash.car);
+        if (mine(e.Crash.car)) {
+          audio.play('crash', 0.55, audio.random(0.85, 1.15));
+          this.shake = 1.5;
+        }
       } else if ('Finish' in e && mine(e.Finish.car) && this.finishedAt < 0) this.finish(s);
     }
   }
